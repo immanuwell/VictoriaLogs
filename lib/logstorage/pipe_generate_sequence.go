@@ -52,7 +52,7 @@ func (pg *pipeGenerateSequence) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pg *pipeGenerateSequence) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (pg *pipeGenerateSequence) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	pgp := &pipeGenerateSequenceProcessor{
 		pg:     pg,
 		stopCh: stopCh,
@@ -64,7 +64,7 @@ func (pg *pipeGenerateSequence) newPipeProcessor(_ int, stopCh <-chan struct{}, 
 
 type pipeGenerateSequenceProcessor struct {
 	pg     *pipeGenerateSequence
-	cancel func()
+	cancel func(error)
 	stopCh <-chan struct{}
 	ppNext pipeProcessor
 }
@@ -72,10 +72,10 @@ type pipeGenerateSequenceProcessor struct {
 func (pgp *pipeGenerateSequenceProcessor) writeBlock(_ uint, _ *blockResult) {
 	// Notify the caller it must stop sending new data blocks here.
 	// The requested sequence is generated in full in the flush() call.
-	pgp.cancel()
+	pgp.cancel(nil)
 }
 
-func (pgp *pipeGenerateSequenceProcessor) flush() error {
+func (pgp *pipeGenerateSequenceProcessor) flush() {
 	rcs := make([]resultColumn, 1)
 	rc := &rcs[0]
 	rc.name = "_msg"
@@ -85,7 +85,7 @@ func (pgp *pipeGenerateSequenceProcessor) flush() error {
 
 	for i := range pgp.pg.n {
 		if needStop(pgp.stopCh) {
-			return nil
+			return
 		}
 
 		bufLen := len(buf)
@@ -106,8 +106,6 @@ func (pgp *pipeGenerateSequenceProcessor) flush() error {
 		br.setResultColumns(rcs, len(rc.values))
 		pgp.ppNext.writeBlock(0, &br)
 	}
-
-	return nil
 }
 
 func parsePipeGenerateSequence(lex *lexer) (pipe, error) {

@@ -43,10 +43,10 @@ func (fi *filterEqualsCommonCase) matchRowByField(fields []Field, fieldName stri
 	return fi.equalsAny.matchRowByField(fields, fieldName)
 }
 
-func (fi *filterEqualsCommonCase) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
-	fi.equalsAny.applyToBlockResultByField(br, bm, fieldName)
+func (fi *filterEqualsCommonCase) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
+	return fi.equalsAny.applyToBlockResultByField(br, bm, fieldName)
 }
 
-func (fi *filterEqualsCommonCase) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
-	fi.equalsAny.applyToBlockSearchByField(bs, bm, fieldName)
+func (fi *filterEqualsCommonCase) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
+	return fi.equalsAny.applyToBlockSearchByField(bs, bm, fieldName)
 }

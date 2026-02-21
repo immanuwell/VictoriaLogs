@@ -58,10 +58,11 @@ func (pf *pipeFilter) visitSubqueries(visitFunc func(q *Query)) {
 	visitSubqueriesInFilter(pf.f, visitFunc)
 }
 
-func (pf *pipeFilter) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pf *pipeFilter) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	pfp := &pipeFilterProcessor{
 		pf:     pf,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 	return pfp
 }
@@ -71,6 +72,7 @@ type pipeFilterProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeFilterProcessorShard]
+	cancel func(error)
 }
 
 type pipeFilterProcessorShard struct {
@@ -88,7 +90,10 @@ func (pfp *pipeFilterProcessor) writeBlock(workerID uint, br *blockResult) {
 	bm := &shard.bm
 	bm.init(br.rowsLen)
 	bm.setBits()
-	pfp.pf.f.applyToBlockResult(br, bm)
+	if err := pfp.pf.f.applyToBlockResult(br, bm); err != nil {
+		pfp.cancel(err)
+		return
+	}
 	if bm.areAllBitsSet() {
 		// Fast path - the filter didn't filter out anything - send br to the next pipe as is.
 		pfp.ppNext.writeBlock(workerID, br)
@@ -104,9 +109,7 @@ func (pfp *pipeFilterProcessor) writeBlock(workerID uint, br *blockResult) {
 	pfp.ppNext.writeBlock(workerID, &shard.br)
 }
 
-func (pfp *pipeFilterProcessor) flush() error {
-	return nil
-}
+func (pfp *pipeFilterProcessor) flush() {}
 
 func parsePipeFilter(lex *lexer) (pipe, error) {
 	return parsePipeFilterExt(lex, true)

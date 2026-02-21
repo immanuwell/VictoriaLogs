@@ -65,7 +65,7 @@ func (pf *pipeFieldValues) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pf *pipeFieldValues) newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (pf *pipeFieldValues) newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	hitsFieldName := pf.getHitsFieldName()
 	pu := &pipeUniq{
 		byFields:      []string{pf.field},

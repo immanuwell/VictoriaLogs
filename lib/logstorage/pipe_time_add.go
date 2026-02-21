@@ -59,10 +59,11 @@ func (pa *pipeTimeAdd) visitSubqueries(_ func(q *Query)) {
 	// do nothing
 }
 
-func (pa *pipeTimeAdd) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pa *pipeTimeAdd) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeTimeAddProcessor{
 		pa:     pa,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -71,6 +72,7 @@ type pipeTimeAddProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeTimeAddProcessorShard]
+	cancel func(error)
 }
 
 type pipeTimeAddProcessorShard struct {
@@ -90,7 +92,11 @@ func (pap *pipeTimeAddProcessor) writeBlock(workerID uint, br *blockResult) {
 
 	c := br.getColumnByName(pa.field)
 	for rowIdx := range br.rowsLen {
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			pap.cancel(err)
+			return
+		}
 		ts, ok := TryParseTimestampRFC3339Nano(v)
 		if ok {
 			ts = SubInt64NoOverflow(ts, pa.offset)
@@ -108,9 +114,7 @@ func (pap *pipeTimeAddProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.buf = shard.buf[:0]
 }
 
-func (pap *pipeTimeAddProcessor) flush() error {
-	return nil
-}
+func (pap *pipeTimeAddProcessor) flush() {}
 
 func parsePipeTimeAdd(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("time_add") {

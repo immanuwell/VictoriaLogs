@@ -51,10 +51,11 @@ func (ps *pipeQueryStats) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (ps *pipeQueryStats) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (ps *pipeQueryStats) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	psp := &pipeQueryStatsProcessor{
 		ps:     ps,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 	return psp
 }
@@ -64,6 +65,7 @@ type pipeQueryStatsProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeQueryStatsProcessorShard]
+	cancel func(error)
 
 	// qs must be set via setQueryStats() before flush() call.
 	qs *QueryStats
@@ -89,14 +91,17 @@ func (psp *pipeQueryStatsProcessor) writeBlock(workerID uint, br *blockResult) {
 
 	cs := br.getColumns()
 	for _, c := range cs {
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			psp.cancel(err)
+			return
+		}
 		shard.sink += len(values)
 	}
 }
 
-func (psp *pipeQueryStatsProcessor) flush() error {
+func (psp *pipeQueryStatsProcessor) flush() {
 	psp.qs.writeToPipeProcessor(psp.ppNext, psp.queryDurationNsecs)
-	return nil
 }
 
 func parsePipeQueryStats(lex *lexer) (pipe, error) {

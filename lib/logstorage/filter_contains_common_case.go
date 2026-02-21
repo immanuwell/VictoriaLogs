@@ -46,12 +46,12 @@ func (fi *filterContainsCommonCase) matchRowByField(fields []Field, fieldName st
 	return fi.containsAny.matchRowByField(fields, fieldName)
 }
 
-func (fi *filterContainsCommonCase) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
-	fi.containsAny.applyToBlockResultByField(br, bm, fieldName)
+func (fi *filterContainsCommonCase) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
+	return fi.containsAny.applyToBlockResultByField(br, bm, fieldName)
 }
 
-func (fi *filterContainsCommonCase) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
-	fi.containsAny.applyToBlockSearchByField(bs, bm, fieldName)
+func (fi *filterContainsCommonCase) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
+	return fi.containsAny.applyToBlockSearchByField(bs, bm, fieldName)
 }
 
 func getCommonCasePhrases(phrases []string) ([]string, error) {

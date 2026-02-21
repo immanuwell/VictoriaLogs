@@ -16,71 +16,92 @@ type statsJSONValuesTopkProcessor struct {
 	sortValuesBuf []string
 }
 
-func (svp *statsJSONValuesTopkProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (svp *statsJSONValuesTopkProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sv := sf.(*statsJSONValues)
 
-	svp.initSortColumns(br, sv.sortFields)
+	if err := svp.initSortColumns(br, sv.sortFields); err != nil {
+		return 0, err
+	}
 
 	stateSizeIncrease := 0
 	mc := getMatchingColumns(br, sv.fieldFilters)
+	defer putMatchingColumns(mc)
 	mc.sort()
 	for rowIdx := range br.rowsLen {
-		stateSizeIncrease += svp.updateStateForRow(sv, br, mc.cs, rowIdx)
+		state, err := svp.updateStateForRow(sv, br, mc.cs, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
 	}
-	putMatchingColumns(mc)
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (svp *statsJSONValuesTopkProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (svp *statsJSONValuesTopkProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sv := sf.(*statsJSONValues)
 
-	svp.initSortColumns(br, sv.sortFields)
+	if err := svp.initSortColumns(br, sv.sortFields); err != nil {
+		return 0, err
+	}
 
 	mc := getMatchingColumns(br, sv.fieldFilters)
+	defer putMatchingColumns(mc)
 	mc.sort()
-	stateSizeIncrease := svp.updateStateForRow(sv, br, mc.cs, rowIdx)
-	putMatchingColumns(mc)
+	stateSizeIncrease, err := svp.updateStateForRow(sv, br, mc.cs, rowIdx)
+	if err != nil {
+		return 0, err
+	}
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (svp *statsJSONValuesTopkProcessor) updateStateForRow(sv *statsJSONValues, br *blockResult, cs []*blockResultColumn, rowIdx int) int {
+func (svp *statsJSONValuesTopkProcessor) updateStateForRow(sv *statsJSONValues, br *blockResult, cs []*blockResultColumn, rowIdx int) (int, error) {
 	svp.sortValuesBuf = slicesutil.SetLength(svp.sortValuesBuf, len(svp.sortColumns))
 	for i, values := range svp.sortColumns {
 		svp.sortValuesBuf[i] = values[rowIdx]
 	}
 
 	if uint64(len(svp.h.entries)) < sv.limit {
-		e := newStatsJSONValuesSortedEntry(br, cs, svp.sortValuesBuf, rowIdx)
+		e, err := newStatsJSONValuesSortedEntry(br, cs, svp.sortValuesBuf, rowIdx)
+		if err != nil {
+			return 0, err
+		}
 		svp.h.entries = append(svp.h.entries, e)
 		heap.Fix(&svp.h, len(svp.h.entries)-1)
 
-		return e.sizeBytes()
+		return e.sizeBytes(), nil
 	}
 
 	top := svp.h.entries[0]
 	if !statsJSONValuesLess(sv.sortFields, svp.sortValuesBuf, top.sortValues) {
 		// Fast path - the current entry is bigger than the biggest entry in the entries
-		return 0
+		return 0, nil
 	}
 
 	// Slow path - replace the top entry with the current entry
-	e := newStatsJSONValuesSortedEntry(br, cs, svp.sortValuesBuf, rowIdx)
+	e, err := newStatsJSONValuesSortedEntry(br, cs, svp.sortValuesBuf, rowIdx)
+	if err != nil {
+		return 0, err
+	}
 	bytesAllocated := e.sizeBytes() - top.sizeBytes()
 	svp.h.entries[0] = e
 	heap.Fix(&svp.h, 0)
 
-	return bytesAllocated
+	return bytesAllocated, nil
 }
 
-func (svp *statsJSONValuesTopkProcessor) initSortColumns(br *blockResult, sortFields []*bySortField) {
+func (svp *statsJSONValuesTopkProcessor) initSortColumns(br *blockResult, sortFields []*bySortField) error {
 	svp.sortColumns = svp.sortColumns[:0]
 	for _, sf := range sortFields {
 		c := br.getColumnByName(sf.name)
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return err
+		}
 		svp.sortColumns = append(svp.sortColumns, values)
 	}
+	return nil
 }
 
 func (svp *statsJSONValuesTopkProcessor) mergeState(_ *chunkedAllocator, _ statsFunc, sfp statsProcessor) {

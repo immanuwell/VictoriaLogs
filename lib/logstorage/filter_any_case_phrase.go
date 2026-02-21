@@ -84,66 +84,68 @@ func (fp *filterAnyCasePhrase) matchRowByField(fields []Field, fieldName string)
 	return matchAnyCasePhrase(v, phraseLowercase)
 }
 
-func (fp *filterAnyCasePhrase) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fp *filterAnyCasePhrase) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	phraseLowercase := fp.getPhraseLowercase()
-	applyToBlockResultGeneric(br, bm, fieldName, phraseLowercase, matchAnyCasePhrase)
+	return applyToBlockResultGeneric(br, bm, fieldName, phraseLowercase, matchAnyCasePhrase)
 }
 
-func (fp *filterAnyCasePhrase) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fp *filterAnyCasePhrase) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	phraseLowercase := fp.getPhraseLowercase()
 
 	// Verify whether fp matches const column
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if !matchAnyCasePhrase(v, phraseLowercase) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether fp matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		// Fast path - there are no matching columns.
 		// It matches anything only for empty phrase.
 		if len(phraseLowercase) > 0 {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	tokens := fp.getTokensHashes()
 
 	switch ch.valueType {
 	case valueTypeString:
-		matchStringByAnyCasePhrase(bs, ch, bm, phraseLowercase)
+		return matchStringByAnyCasePhrase(bs, ch, bm, phraseLowercase)
 	case valueTypeDict:
-		matchValuesDictByAnyCasePhrase(bs, ch, bm, phraseLowercase)
+		return matchValuesDictByAnyCasePhrase(bs, ch, bm, phraseLowercase)
 	case valueTypeUint8:
-		matchUint8ByExactValue(bs, ch, bm, phraseLowercase, tokens)
+		return matchUint8ByExactValue(bs, ch, bm, phraseLowercase, tokens)
 	case valueTypeUint16:
-		matchUint16ByExactValue(bs, ch, bm, phraseLowercase, tokens)
+		return matchUint16ByExactValue(bs, ch, bm, phraseLowercase, tokens)
 	case valueTypeUint32:
-		matchUint32ByExactValue(bs, ch, bm, phraseLowercase, tokens)
+		return matchUint32ByExactValue(bs, ch, bm, phraseLowercase, tokens)
 	case valueTypeUint64:
-		matchUint64ByExactValue(bs, ch, bm, phraseLowercase, tokens)
+		return matchUint64ByExactValue(bs, ch, bm, phraseLowercase, tokens)
 	case valueTypeInt64:
-		matchInt64ByExactValue(bs, ch, bm, phraseLowercase, tokens)
+		return matchInt64ByExactValue(bs, ch, bm, phraseLowercase, tokens)
 	case valueTypeFloat64:
-		matchFloat64ByPhrase(bs, ch, bm, phraseLowercase, tokens)
+		return matchFloat64ByPhrase(bs, ch, bm, phraseLowercase, tokens)
 	case valueTypeIPv4:
-		matchIPv4ByPhrase(bs, ch, bm, phraseLowercase, tokens)
+		return matchIPv4ByPhrase(bs, ch, bm, phraseLowercase, tokens)
 	case valueTypeTimestampISO8601:
 		phraseUppercase := fp.getPhraseUppercase()
 		tokensUppercase := fp.getTokensHashesUppercase()
-		matchTimestampISO8601ByPhrase(bs, ch, bm, phraseUppercase, tokensUppercase)
+		return matchTimestampISO8601ByPhrase(bs, ch, bm, phraseUppercase, tokensUppercase)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
-func matchValuesDictByAnyCasePhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phraseLowercase string) {
+func matchValuesDictByAnyCasePhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phraseLowercase string) error {
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 	for _, v := range ch.valuesDict.values {
 		c := byte(0)
 		if matchAnyCasePhrase(v, phraseLowercase) {
@@ -151,12 +153,11 @@ func matchValuesDictByAnyCasePhrase(bs *blockSearch, ch *columnHeader, bm *bitma
 		}
 		bb.B = append(bb.B, c)
 	}
-	matchEncodedValuesDict(bs, ch, bm, bb.B)
-	bbPool.Put(bb)
+	return matchEncodedValuesDict(bs, ch, bm, bb.B)
 }
 
-func matchStringByAnyCasePhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phraseLowercase string) {
-	visitValues(bs, ch, bm, func(v string) bool {
+func matchStringByAnyCasePhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phraseLowercase string) error {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		return matchAnyCasePhrase(v, phraseLowercase)
 	})
 }

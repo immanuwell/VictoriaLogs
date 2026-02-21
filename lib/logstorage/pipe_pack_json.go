@@ -60,8 +60,8 @@ func (pp *pipePackJSON) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pp *pipePackJSON) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
-	return newPipePackProcessor(ppNext, pp.resultField, pp.fieldFilters, MarshalFieldsToJSON)
+func (pp *pipePackJSON) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
+	return newPipePackProcessor(ppNext, cancel, pp.resultField, pp.fieldFilters, MarshalFieldsToJSON)
 }
 
 func parsePipePackJSON(lex *lexer) (pipe, error) {

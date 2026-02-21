@@ -1,6 +1,7 @@
 package logstorage
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/objectstorage/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/snapshot/snapshotutil"
 )
 
@@ -26,6 +28,9 @@ type partition struct {
 
 	// path is the path to the partition directory
 	path string
+
+	// isRemote defines if partition is remote
+	isRemote bool
 
 	// name is the partition name. It is basically the directory name obtained from path.
 	// It is used for creating keys for partition caches.
@@ -46,7 +51,7 @@ type partition struct {
 
 // mustCreatePartition creates a partition at the given path.
 //
-// The created partition can be opened with mustOpenPartition() after is has been created.
+// The created partition can be opened with mustOpenLocalPartition() after is has been created.
 //
 // The created partition can be deleted with mustDeletePartition() when it is no longer needed.
 func mustCreatePartition(path string) {
@@ -57,21 +62,31 @@ func mustCreatePartition(path string) {
 
 	datadbPath := filepath.Join(path, datadbDirname)
 	mustCreateDatadb(datadbPath)
-
 	fs.MustSyncPathAndParentDir(path)
 }
 
 // mustDeletePartition deletes partition at the given path.
 //
 // The partition must be closed with MustClose before deleting it.
-func mustDeletePartition(path string) {
-	fs.MustRemoveDir(path)
+func mustDeletePartition(path string, sc common.StorageClient) {
+	if sc != nil {
+		partitionReadyFile := filepath.Join(path, partitionReadyFilename)
+		if err := sc.DeletePath(partitionReadyFile, false); err != nil {
+			logger.Errorf("failed to delete %s partition file: %s", sc.GetPath(partitionReadyFile), err)
+			return
+		}
+		if err := sc.DeletePath(path, true); err != nil {
+			logger.Errorf("failed to delete partition at %s: %s", sc.GetPath(path), err)
+		}
+	} else {
+		fs.MustRemoveDir(path)
+	}
 }
 
-// mustOpenPartition opens partition at the given path for the given Storage.
+// mustOpenLocalPartition opens partition at the given path for the given Storage.
 //
 // The returned partition must be closed when no longer needed with mustClosePartition() call.
-func mustOpenPartition(s *Storage, path string) *partition {
+func mustOpenLocalPartition(s *Storage, path string) *partition {
 	name := filepath.Base(path)
 
 	indexdbPath := filepath.Join(path, indexdbDirname)
@@ -92,7 +107,7 @@ func mustOpenPartition(s *Storage, path string) *partition {
 		mustCreateIndexdb(indexdbPath)
 	}
 
-	idb := mustOpenIndexdb(indexdbPath, name, s)
+	idb := mustOpenIndexdb(indexdbPath, name, s, nil)
 
 	// Start initializing the partition
 	pt := &partition{
@@ -108,9 +123,45 @@ func mustOpenPartition(s *Storage, path string) *partition {
 		mustCreateDatadb(datadbPath)
 	}
 
-	pt.ddb = mustOpenDatadb(pt, datadbPath, s.flushInterval)
+	pt.ddb = mustOpenLocalDatadb(pt, datadbPath, s.flushInterval)
 
 	return pt
+}
+
+var errPartitionNotReady = errors.New("no readiness marker found")
+
+// openRemotePartition opens partition at the given path for the given Storage.
+//
+// The returned partition must be closed when no longer needed with mustClosePartition() call.
+func openRemotePartition(s *Storage, path string) (*partition, error) {
+	partitionReadyFile := filepath.Join(path, partitionReadyFilename)
+	if _, err := s.sc.GetFileSize(partitionReadyFile); err != nil {
+		return nil, errPartitionNotReady
+	}
+	name := filepath.Base(path)
+	indexdbPath := filepath.Join(path, indexdbDirname)
+	idb, err := openIndexdb(indexdbPath, name, s, s.sc)
+	if err != nil {
+		return nil, err
+	}
+
+	// Start initializing the partition
+	pt := &partition{
+		s:        s,
+		path:     path,
+		name:     name,
+		idb:      idb,
+		isRemote: true,
+	}
+
+	datadbPath := filepath.Join(path, datadbDirname)
+	pt.ddb, err = openRemoteDatadb(pt, datadbPath)
+	if err != nil {
+		mustCloseIndexdb(idb)
+		return nil, err
+	}
+
+	return pt, nil
 }
 
 // mustClosePartition closes pt.
@@ -263,22 +314,40 @@ func (pt *partition) deleteSnapshot(snapshotName string) error {
 	return nil
 }
 
+// deleteAllSnapshots removes all snapshots for given partition.
+func (pt *partition) deleteAllSnapshots() error {
+	logger.Infof("deleting all snapshots for partition %q", pt.name)
+
+	pt.snapshotLock.Lock()
+	defer pt.snapshotLock.Unlock()
+
+	snapshotsPath := filepath.Join(pt.path, snapshotsDirname)
+	fs.MustRemoveDir(snapshotsPath)
+
+	logger.Infof("deleted all snapshots for partition %q at %q", pt.name, snapshotsPath)
+
+	return nil
+}
+
 func (pt *partition) updateStats(ps *PartitionStats) {
 	pt.ddb.updateStats(&ps.DatadbStats)
 	pt.idb.updateStats(&ps.IndexdbStats)
 }
 
 // mustForceMerge runs forced merge for all the parts in pt.
-func (pt *partition) mustForceMerge() {
+func (pt *partition) mustForceMerge(mergeIndexDB bool) {
 	pt.ddb.mustForceMergeAllParts()
+	if mergeIndexDB {
+		pt.idb.tb.MustForceMergeAllParts()
+	}
 }
 
-func (pt *partition) deleteRows(sso *storageSearchOptions, stopCh <-chan struct{}) bool {
+func (pt *partition) deleteRows(sso *storageSearchOptions, cancel func(error), stopCh <-chan struct{}) bool {
 	// make recently ingested rows visible for search, so they could be deleted.
 	pt.debugFlush()
 
 	pso := pt.getSearchOptions(sso)
-	return pt.ddb.deleteRows(pso, stopCh)
+	return pt.ddb.deleteRows(pso, cancel, stopCh)
 }
 
 func getPartitionDayFromName(name string) (int64, error) {
@@ -296,3 +365,4 @@ func getPartitionNameFromDay(day int64) string {
 }
 
 const partitionNameFormat = "20060102"
+const partitionReadyFilename = "partition.ready"

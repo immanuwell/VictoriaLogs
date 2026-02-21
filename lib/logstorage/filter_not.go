@@ -35,22 +35,28 @@ func (fn *filterNot) matchRow(fields []Field) bool {
 	return !fn.f.matchRow(fields)
 }
 
-func (fn *filterNot) applyToBlockResult(br *blockResult, bm *bitmap) {
+func (fn *filterNot) applyToBlockResult(br *blockResult, bm *bitmap) error {
 	// Minimize the number of rows to check by the filter by applying it
 	// only to the rows, which match the bm, e.g. they may change the bm result.
 	bmTmp := getBitmap(bm.bitsLen)
+	defer putBitmap(bmTmp)
 	bmTmp.copyFrom(bm)
-	fn.f.applyToBlockResult(br, bmTmp)
+	if err := fn.f.applyToBlockResult(br, bmTmp); err != nil {
+		return err
+	}
 	bm.andNot(bmTmp)
-	putBitmap(bmTmp)
+	return nil
 }
 
-func (fn *filterNot) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
+func (fn *filterNot) applyToBlockSearch(bs *blockSearch, bm *bitmap) error {
 	// Minimize the number of rows to check by the filter by applying it
 	// only to the rows, which match the bm, e.g. they may change the bm result.
 	bmTmp := getBitmap(bm.bitsLen)
+	defer putBitmap(bmTmp)
 	bmTmp.copyFrom(bm)
-	fn.f.applyToBlockSearch(bs, bmTmp)
+	if err := fn.f.applyToBlockSearch(bs, bmTmp); err != nil {
+		return err
+	}
 	bm.andNot(bmTmp)
-	putBitmap(bmTmp)
+	return nil
 }

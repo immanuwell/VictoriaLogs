@@ -31,19 +31,19 @@ type statsRowAnyProcessor struct {
 	fields []Field
 }
 
-func (sap *statsRowAnyProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (sap *statsRowAnyProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sa := sf.(*statsRowAny)
 	if len(sap.fields) > 0 {
-		return 0
+		return 0, nil
 	}
 
 	return sap.updateState(sa, br, 0)
 }
 
-func (sap *statsRowAnyProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (sap *statsRowAnyProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sa := sf.(*statsRowAny)
 	if len(sap.fields) > 0 {
-		return 0
+		return 0, nil
 	}
 
 	return sap.updateState(sa, br, rowIdx)
@@ -123,26 +123,33 @@ func fieldsStateSize(fields []Field) int {
 	return stateSize
 }
 
-func (sap *statsRowAnyProcessor) updateState(sa *statsRowAny, br *blockResult, rowIdx int) int {
+func (sap *statsRowAnyProcessor) updateState(sa *statsRowAny, br *blockResult, rowIdx int) (int, error) {
 	mc := getMatchingColumns(br, sa.fieldFilters)
 	defer putMatchingColumns(mc)
 
 	emptyRow := true
 	for _, c := range mc.cs {
-		if v := c.getValueAtRow(br, rowIdx); v != "" {
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+		if v != "" {
 			emptyRow = false
 			break
 		}
 	}
 
 	if emptyRow {
-		return 0
+		return 0, nil
 	}
 
 	stateSizeIncrease := 0
 	sap.fields = sap.fields[:0]
 	for _, c := range mc.cs {
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
 		sap.fields = append(sap.fields, Field{
 			Name:  strings.Clone(c.name),
 			Value: strings.Clone(v),
@@ -150,7 +157,7 @@ func (sap *statsRowAnyProcessor) updateState(sa *statsRowAny, br *blockResult, r
 		stateSizeIncrease += len(c.name) + len(v)
 	}
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
 func (sap *statsRowAnyProcessor) finalizeStats(_ statsFunc, dst []byte, _ <-chan struct{}) []byte {

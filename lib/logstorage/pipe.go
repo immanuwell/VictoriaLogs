@@ -47,7 +47,7 @@ type pipe interface {
 	// It is OK to continue processing pipeProcessor calls if they take less than a few milliseconds.
 	//
 	// The returned pipeProcessor may call cancel() at any time in order to notify the caller to stop sending new data to it.
-	newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor
+	newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor
 
 	// hasFilterInWithQuery must return true of pipe contains 'in(subquery)' filter (recursively).
 	hasFilterInWithQuery() bool
@@ -85,7 +85,7 @@ type pipeProcessor interface {
 	// flush is called after all the worker goroutines are stopped.
 	//
 	// It is guaranteed that flush() is called for every pipeProcessor returned from pipe.newPipeProcessor().
-	flush() error
+	flush()
 }
 
 type noopPipeProcessor struct {
@@ -107,9 +107,8 @@ func (npp *noopPipeProcessor) writeBlock(workerID uint, br *blockResult) {
 	npp.writeBlockFinal(workerID, br)
 }
 
-func (npp *noopPipeProcessor) flush() error {
+func (npp *noopPipeProcessor) flush() {
 	logger.Panicf("BUG: mustn't be called!")
-	return nil
 }
 
 func parsePipes(lex *lexer) ([]pipe, error) {

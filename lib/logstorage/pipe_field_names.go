@@ -80,11 +80,12 @@ func (pf *pipeFieldNames) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pf *pipeFieldNames) newPipeProcessor(_ int, stopCh <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pf *pipeFieldNames) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	pfp := &pipeFieldNamesProcessor{
 		pf:     pf,
 		stopCh: stopCh,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 	return pfp
 }
@@ -95,6 +96,7 @@ type pipeFieldNamesProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeFieldNamesProcessorShard]
+	cancel func(error)
 }
 
 type pipeFieldNamesProcessorShard struct {
@@ -130,7 +132,11 @@ func (pfp *pipeFieldNamesProcessor) writeBlock(workerID uint, br *blockResult) {
 			shard.updateColumnHits(c.name, filter, hits)
 		}
 	} else {
-		cshIndex := br.bs.getColumnsHeaderIndex()
+		cshIndex, err := br.bs.getColumnsHeaderIndex()
+		if err != nil {
+			pfp.cancel(err)
+			return
+		}
 		shard.updateHits(cshIndex.columnHeadersRefs, br, filter, hits)
 		shard.updateHits(cshIndex.constColumnsRefs, br, filter, hits)
 		shard.updateColumnHits("_time", filter, hits)
@@ -164,15 +170,15 @@ func (shard *pipeFieldNamesProcessorShard) updateColumnHits(columnName, filter s
 	*pHits += hits
 }
 
-func (pfp *pipeFieldNamesProcessor) flush() error {
+func (pfp *pipeFieldNamesProcessor) flush() {
 	if needStop(pfp.stopCh) {
-		return nil
+		return
 	}
 
 	// merge state across shards
 	shards := pfp.shards.All()
 	if len(shards) == 0 {
-		return nil
+		return
 	}
 
 	m := shards[0].getM()
@@ -200,8 +206,6 @@ func (pfp *pipeFieldNamesProcessor) flush() error {
 		wctx.writeRow(name, hits)
 	}
 	wctx.flush()
-
-	return nil
 }
 
 type pipeFieldNamesWriteContext struct {

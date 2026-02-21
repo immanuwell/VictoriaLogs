@@ -106,7 +106,7 @@ func (pt *pipeTop) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pt *pipeTop) newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (pt *pipeTop) newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	maxStateSize := int64(float64(memory.Allowed()) * 0.4)
 
 	ptp := &pipeTopProcessor{
@@ -118,6 +118,7 @@ func (pt *pipeTop) newPipeProcessor(concurrency int, stopCh <-chan struct{}, can
 		maxStateSize: maxStateSize,
 	}
 	ptp.shards.Init = func(shard *pipeTopProcessorShard) {
+		shard.ptp = ptp
 		shard.pt = pt
 		shard.m.init(uint(concurrency), "", &shard.stateSizeBudget)
 	}
@@ -129,7 +130,7 @@ func (pt *pipeTop) newPipeProcessor(concurrency int, stopCh <-chan struct{}, can
 type pipeTopProcessor struct {
 	pt     *pipeTop
 	stopCh <-chan struct{}
-	cancel func()
+	cancel func(error)
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeTopProcessorShard]
@@ -139,6 +140,8 @@ type pipeTopProcessor struct {
 }
 
 type pipeTopProcessorShard struct {
+	ptp *pipeTopProcessor
+
 	// pt points to the parent pipeTop.
 	pt *pipeTop
 
@@ -161,7 +164,9 @@ func (shard *pipeTopProcessorShard) writeBlock(br *blockResult) {
 	byFields := shard.pt.byFields
 	if len(byFields) == 1 {
 		// Fast path for a single field.
-		shard.updateStatsSingleColumn(br, byFields[0])
+		if err := shard.updateStatsSingleColumn(br, byFields[0]); err != nil {
+			shard.ptp.cancel(err)
+		}
 		return
 	}
 
@@ -169,7 +174,11 @@ func (shard *pipeTopProcessorShard) writeBlock(br *blockResult) {
 	columnValues := shard.columnValues[:0]
 	for _, f := range byFields {
 		c := br.getColumnByName(f)
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			shard.ptp.cancel(err)
+			return
+		}
 		columnValues = append(columnValues, values)
 	}
 	shard.columnValues = columnValues
@@ -208,18 +217,21 @@ func isEqualPrevRow(columnValues [][]string, rowIdx int) bool {
 	return true
 }
 
-func (shard *pipeTopProcessorShard) updateStatsSingleColumn(br *blockResult, fieldName string) {
+func (shard *pipeTopProcessorShard) updateStatsSingleColumn(br *blockResult, fieldName string) error {
 	c := br.getColumnByName(fieldName)
 	if c.isConst {
 		v := c.valuesEncoded[0]
 		shard.m.updateStateGeneric(v, uint64(br.rowsLen))
-		return
+		return nil
 	}
 	switch c.valueType {
 	case valueTypeDict:
-		c.forEachDictValueWithHits(br, shard.m.updateStateGeneric)
+		return c.forEachDictValueWithHits(br, shard.m.updateStateGeneric)
 	case valueTypeUint8:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		hits := uint64(1)
 		for rowIdx := 1; rowIdx < len(values); rowIdx++ {
 			if values[rowIdx-1] == values[rowIdx] {
@@ -233,31 +245,46 @@ func (shard *pipeTopProcessorShard) updateStatsSingleColumn(br *blockResult, fie
 		n := uint64(unmarshalUint8(values[len(values)-1]))
 		shard.m.updateStateUint64(n, hits)
 	case valueTypeUint16:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := uint64(unmarshalUint16(v))
 			shard.m.updateStateUint64(n, 1)
 		}
 	case valueTypeUint32:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := uint64(unmarshalUint32(v))
 			shard.m.updateStateUint64(n, 1)
 		}
 	case valueTypeUint64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalUint64(v)
 			shard.m.updateStateUint64(n, 1)
 		}
 	case valueTypeInt64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalInt64(v)
 			shard.m.updateStateInt64(n, 1)
 		}
 	default:
-		values := c.getValues(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		hits := uint64(1)
 		for rowIdx := 1; rowIdx < len(values); rowIdx++ {
 			if values[rowIdx-1] == values[rowIdx] {
@@ -269,6 +296,7 @@ func (shard *pipeTopProcessorShard) updateStatsSingleColumn(br *blockResult, fie
 		}
 		shard.m.updateStateGeneric(values[len(values)-1], hits)
 	}
+	return nil
 }
 
 func (ptp *pipeTopProcessor) writeBlock(workerID uint, br *blockResult) {
@@ -285,7 +313,7 @@ func (ptp *pipeTopProcessor) writeBlock(workerID uint, br *blockResult) {
 			// The state size is too big. Stop processing data in order to avoid OOM crash.
 			if remaining+stateSizeBudgetChunk >= 0 {
 				// Notify worker goroutines to stop calling writeBlock() in order to save CPU time.
-				ptp.cancel()
+				ptp.cancel(nil)
 			}
 			return
 		}
@@ -295,15 +323,16 @@ func (ptp *pipeTopProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.writeBlock(br)
 }
 
-func (ptp *pipeTopProcessor) flush() error {
+func (ptp *pipeTopProcessor) flush() {
 	if n := ptp.stateSizeBudget.Load(); n <= 0 {
-		return fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", ptp.pt.String(), ptp.maxStateSize/(1<<20))
+		ptp.cancel(fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", ptp.pt.String(), ptp.maxStateSize/(1<<20)))
+		return
 	}
 
 	// merge state across shards in parallel
 	entries := ptp.mergeShardsParallel()
 	if needStop(ptp.stopCh) {
-		return nil
+		return
 	}
 
 	// write result
@@ -338,7 +367,7 @@ func (ptp *pipeTopProcessor) flush() error {
 		fieldName := byFields[0]
 		for i, e := range entries {
 			if needStop(ptp.stopCh) {
-				return nil
+				return
 			}
 
 			rowFields = append(rowFields[:0], Field{
@@ -352,7 +381,7 @@ func (ptp *pipeTopProcessor) flush() error {
 	} else {
 		for i, e := range entries {
 			if needStop(ptp.stopCh) {
-				return nil
+				return
 			}
 
 			rowFields = rowFields[:0]
@@ -378,8 +407,6 @@ func (ptp *pipeTopProcessor) flush() error {
 	}
 
 	wctx.flush()
-
-	return nil
 }
 
 func (ptp *pipeTopProcessor) mergeShardsParallel() []*pipeTopEntry {

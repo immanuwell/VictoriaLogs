@@ -31,12 +31,12 @@ type statsRateSumProcessor struct {
 	ssp statsSumProcessor
 }
 
-func (srp *statsRateSumProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (srp *statsRateSumProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	ss := sf.(*statsRateSum)
 	return srp.ssp.updateStatsForAllRows(ss.ss, br)
 }
 
-func (srp *statsRateSumProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (srp *statsRateSumProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	ss := sf.(*statsRateSum)
 	return srp.ssp.updateStatsForRow(ss.ss, br, rowIdx)
 }

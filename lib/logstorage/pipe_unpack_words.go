@@ -72,10 +72,11 @@ func (pu *pipeUnpackWords) updateNeededFields(pf *prefixfilter.Filter) {
 	}
 }
 
-func (pu *pipeUnpackWords) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pu *pipeUnpackWords) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeUnpackWordsProcessor{
 		pu:     pu,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -84,6 +85,7 @@ type pipeUnpackWordsProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeUnpackWordsProcessorShard]
+	cancel func(error)
 }
 
 type pipeUnpackWordsProcessorShard struct {
@@ -103,10 +105,22 @@ func (pup *pipeUnpackWordsProcessor) writeBlock(workerID uint, br *blockResult) 
 	shard := pup.shards.Get(workerID)
 	shard.wctx.init(workerID, pup.ppNext, false, false, br)
 
+	defer func() {
+		shard.wctx.flush()
+		shard.wctx.reset()
+		shard.a.reset()
+	}()
+
 	c := br.getColumnByName(pu.srcField)
-	values := c.getValues(br)
+	values, err := c.getValues(br)
+	if err != nil {
+		pup.cancel(err)
+		return
+	}
 
 	t := getTokenizer()
+	defer putTokenizer(t)
+
 	keepDuplicateTokens := !pu.dropDuplicates
 	for rowIdx := range values {
 		if rowIdx == 0 || values[rowIdx] != values[rowIdx-1] {
@@ -119,18 +133,14 @@ func (pup *pipeUnpackWordsProcessor) writeBlock(workerID uint, br *blockResult) 
 				Value: bytesutil.ToUnsafeString(shard.a.b[bufLen:]),
 			}
 		}
-		shard.wctx.writeRow(rowIdx, shard.fields[:])
+		if err := shard.wctx.writeRow(rowIdx, shard.fields[:]); err != nil {
+			pup.cancel(err)
+			return
+		}
 	}
-	putTokenizer(t)
-
-	shard.wctx.flush()
-	shard.wctx.reset()
-	shard.a.reset()
 }
 
-func (pup *pipeUnpackWordsProcessor) flush() error {
-	return nil
-}
+func (pup *pipeUnpackWordsProcessor) flush() {}
 
 func parsePipeUnpackWords(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("unpack_words") {

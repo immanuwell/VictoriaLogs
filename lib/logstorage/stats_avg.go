@@ -31,34 +31,39 @@ type statsAvgProcessor struct {
 	count uint64
 }
 
-func (sap *statsAvgProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (sap *statsAvgProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sa := sf.(*statsAvg)
 
 	mc := getMatchingColumns(br, sa.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		f, count := c.sumValues(br)
+		f, count, err := c.sumValues(br)
+		if err != nil {
+			return 0, err
+		}
 		sap.sum += f
 		sap.count += uint64(count)
 	}
-	putMatchingColumns(mc)
 
-	return 0
+	return 0, nil
 }
 
-func (sap *statsAvgProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (sap *statsAvgProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sa := sf.(*statsAvg)
 
 	mc := getMatchingColumns(br, sa.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		f, ok := c.getFloatValueAtRow(br, rowIdx)
-		if ok {
+		f, ok, err := c.getFloatValueAtRow(br, rowIdx)
+		if err != nil {
+			return 0, err
+		} else if ok {
 			sap.sum += f
 			sap.count++
 		}
 	}
-	putMatchingColumns(mc)
 
-	return 0
+	return 0, nil
 }
 
 func (sap *statsAvgProcessor) mergeState(_ *chunkedAllocator, _ statsFunc, sfp statsProcessor) {

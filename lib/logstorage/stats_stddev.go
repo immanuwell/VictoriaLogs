@@ -35,36 +35,40 @@ type statsStddevProcessor struct {
 	count float64
 }
 
-func (ssp *statsStddevProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (ssp *statsStddevProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	ss := sf.(*statsStddev)
 
 	mc := getMatchingColumns(br, ss.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
 		for rowIdx := range br.rowsLen {
-			f, ok := c.getFloatValueAtRow(br, rowIdx)
-			if ok {
+			f, ok, err := c.getFloatValueAtRow(br, rowIdx)
+			if err != nil {
+				return 0, err
+			} else if ok {
 				ssp.updateState(f)
 			}
 		}
 	}
-	putMatchingColumns(mc)
 
-	return 0
+	return 0, nil
 }
 
-func (ssp *statsStddevProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (ssp *statsStddevProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	ss := sf.(*statsStddev)
 
 	mc := getMatchingColumns(br, ss.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		f, ok := c.getFloatValueAtRow(br, rowIdx)
-		if ok {
+		f, ok, err := c.getFloatValueAtRow(br, rowIdx)
+		if err != nil {
+			return 0, err
+		} else if ok {
 			ssp.updateState(f)
 		}
 	}
-	putMatchingColumns(mc)
 
-	return 0
+	return 0, nil
 }
 
 func (ssp *statsStddevProcessor) updateState(f float64) {

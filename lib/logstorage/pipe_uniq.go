@@ -86,7 +86,7 @@ func (pu *pipeUniq) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pu *pipeUniq) newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (pu *pipeUniq) newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	maxStateSize := int64(float64(memory.Allowed()) * 0.4)
 
 	pup := &pipeUniqProcessor{
@@ -98,6 +98,7 @@ func (pu *pipeUniq) newPipeProcessor(concurrency int, stopCh <-chan struct{}, ca
 		maxStateSize: maxStateSize,
 	}
 	pup.shards.Init = func(shard *pipeUniqProcessorShard) {
+		shard.pup = pup
 		shard.pu = pu
 		shard.m.init(uint(concurrency), pu.filter, &shard.stateSizeBudget)
 	}
@@ -109,7 +110,7 @@ func (pu *pipeUniq) newPipeProcessor(concurrency int, stopCh <-chan struct{}, ca
 type pipeUniqProcessor struct {
 	pu     *pipeUniq
 	stopCh <-chan struct{}
-	cancel func()
+	cancel func(error)
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeUniqProcessorShard]
@@ -119,6 +120,8 @@ type pipeUniqProcessor struct {
 }
 
 type pipeUniqProcessorShard struct {
+	pup *pipeUniqProcessor
+
 	// pu points to the parent pipeUniq.
 	pu *pipeUniq
 
@@ -148,7 +151,10 @@ func (shard *pipeUniqProcessorShard) writeBlock(br *blockResult) bool {
 	byFields := shard.pu.byFields
 	if len(byFields) == 1 {
 		// Fast path for a single field.
-		shard.updateStatsSingleColumn(br, byFields[0], needHits)
+		if err := shard.updateStatsSingleColumn(br, byFields[0], needHits); err != nil {
+			shard.pup.cancel(err)
+			return false
+		}
 		return true
 	}
 
@@ -156,7 +162,11 @@ func (shard *pipeUniqProcessorShard) writeBlock(br *blockResult) bool {
 	columnValues := shard.columnValues[:0]
 	for _, f := range byFields {
 		c := br.getColumnByName(f)
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			shard.pup.cancel(err)
+			return false
+		}
 		columnValues = append(columnValues, values)
 	}
 	shard.columnValues = columnValues
@@ -185,56 +195,75 @@ func (shard *pipeUniqProcessorShard) writeBlock(br *blockResult) bool {
 	return true
 }
 
-func (shard *pipeUniqProcessorShard) updateStatsSingleColumn(br *blockResult, columnName string, needHits bool) {
+func (shard *pipeUniqProcessorShard) updateStatsSingleColumn(br *blockResult, columnName string, needHits bool) error {
 	c := br.getColumnByName(columnName)
 	if c.isConst {
 		v := c.valuesEncoded[0]
 		shard.m.updateStateGeneric(v, uint64(br.rowsLen))
-		return
+		return nil
 	}
 	switch c.valueType {
 	case valueTypeDict:
-		c.forEachDictValueWithHits(br, func(v string, hits uint64) {
+		return c.forEachDictValueWithHits(br, func(v string, hits uint64) {
 			shard.m.updateStateGeneric(v, hits)
 		})
 	case valueTypeUint8:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalUint8(v)
 			shard.m.updateStateUint64(uint64(n), 1)
 		}
 	case valueTypeUint16:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalUint16(v)
 			shard.m.updateStateUint64(uint64(n), 1)
 		}
 	case valueTypeUint32:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalUint32(v)
 			shard.m.updateStateUint64(uint64(n), 1)
 		}
 	case valueTypeUint64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalUint64(v)
 			shard.m.updateStateUint64(n, 1)
 		}
 	case valueTypeInt64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalInt64(v)
 			shard.m.updateStateInt64(n, 1)
 		}
 	default:
-		values := c.getValues(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for i, v := range values {
 			if needHits || i == 0 || values[i-1] != v {
 				shard.m.updateStateGeneric(v, 1)
 			}
 		}
 	}
+	return nil
 }
 
 func (pup *pipeUniqProcessor) writeBlock(workerID uint, br *blockResult) {
@@ -251,7 +280,7 @@ func (pup *pipeUniqProcessor) writeBlock(workerID uint, br *blockResult) {
 			// The state size is too big. Stop processing data in order to avoid OOM crash.
 			if remaining+stateSizeBudgetChunk >= 0 {
 				// Notify worker goroutines to stop calling writeBlock() in order to save CPU time.
-				pup.cancel()
+				pup.cancel(nil)
 			}
 			return
 		}
@@ -259,19 +288,19 @@ func (pup *pipeUniqProcessor) writeBlock(workerID uint, br *blockResult) {
 	}
 
 	if !shard.writeBlock(br) {
-		pup.cancel()
+		pup.cancel(nil)
 	}
 }
 
-func (pup *pipeUniqProcessor) flush() error {
+func (pup *pipeUniqProcessor) flush() {
 	if n := pup.stateSizeBudget.Load(); n <= 0 {
-		return fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", pup.pu.String(), pup.maxStateSize/(1<<20))
+		pup.cancel(fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", pup.pu.String(), pup.maxStateSize/(1<<20)))
 	}
 
 	// merge state across shards in parallel
 	hms := pup.mergeShardsParallel()
 	if needStop(pup.stopCh) {
-		return nil
+		return
 	}
 
 	resetHits := false
@@ -327,8 +356,6 @@ func (pup *pipeUniqProcessor) flush() error {
 		})
 	}
 	wg.Wait()
-
-	return nil
 }
 
 func (pup *pipeUniqProcessor) writeShardData(workerID uint, hm *hitsMap, resetHits bool) {

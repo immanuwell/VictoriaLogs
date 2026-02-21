@@ -18,7 +18,7 @@ func shouldDenyOverwrittenField(iff *ifFilter, keepOriginalFields, skipEmptyResu
 	return iff == nil && !keepOriginalFields && !skipEmptyResults
 }
 
-func newPipeUpdateProcessor(updateFunc func(a *arena, v string) string, ppNext pipeProcessor, field string, iff *ifFilter) pipeProcessor {
+func newPipeUpdateProcessor(cancel func(error), updateFunc func(a *arena, v string) string, ppNext pipeProcessor, field string, iff *ifFilter) pipeProcessor {
 	return &pipeUpdateProcessor{
 		updateFunc: updateFunc,
 
@@ -26,6 +26,7 @@ func newPipeUpdateProcessor(updateFunc func(a *arena, v string) string, ppNext p
 		iff:   iff,
 
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -38,6 +39,7 @@ type pipeUpdateProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeUpdateProcessorShard]
+	cancel func(error)
 }
 
 type pipeUpdateProcessorShard struct {
@@ -58,7 +60,10 @@ func (pup *pipeUpdateProcessor) writeBlock(workerID uint, br *blockResult) {
 	if iff := pup.iff; iff != nil {
 		bm.init(br.rowsLen)
 		bm.setBits()
-		iff.f.applyToBlockResult(br, bm)
+		if err := iff.f.applyToBlockResult(br, bm); err != nil {
+			pup.cancel(err)
+			return
+		}
 		if bm.isZero() {
 			pup.ppNext.writeBlock(workerID, br)
 			return
@@ -68,7 +73,11 @@ func (pup *pipeUpdateProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.rc.name = pup.field
 
 	c := br.getColumnByName(pup.field)
-	values := c.getValues(br)
+	values, err := c.getValues(br)
+	if err != nil {
+		pup.cancel(err)
+		return
+	}
 
 	needUpdates := true
 	vPrev := ""
@@ -94,6 +103,4 @@ func (pup *pipeUpdateProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.a.reset()
 }
 
-func (pup *pipeUpdateProcessor) flush() error {
-	return nil
-}
+func (pup *pipeUpdateProcessor) flush() {}

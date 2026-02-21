@@ -59,108 +59,109 @@ func (fp *filterPhrase) matchRowByField(fields []Field, fieldName string) bool {
 	return matchPhrase(v, fp.phrase)
 }
 
-func (fp *filterPhrase) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
-	applyToBlockResultGeneric(br, bm, fieldName, fp.phrase, matchPhrase)
+func (fp *filterPhrase) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
+	return applyToBlockResultGeneric(br, bm, fieldName, fp.phrase, matchPhrase)
 }
 
-func (fp *filterPhrase) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fp *filterPhrase) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	phrase := fp.phrase
 
 	// Verify whether fp matches const column
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if !matchPhrase(v, phrase) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether fp matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		// Fast path - there are no matching columns.
 		// It matches anything only for empty phrase.
 		if len(phrase) > 0 {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	tokens := fp.getTokensHashes()
 
 	switch ch.valueType {
 	case valueTypeString:
-		matchStringByPhrase(bs, ch, bm, phrase, tokens)
+		return matchStringByPhrase(bs, ch, bm, phrase, tokens)
 	case valueTypeDict:
-		matchValuesDictByPhrase(bs, ch, bm, phrase)
+		return matchValuesDictByPhrase(bs, ch, bm, phrase)
 	case valueTypeUint8:
-		matchUint8ByExactValue(bs, ch, bm, phrase, tokens)
+		return matchUint8ByExactValue(bs, ch, bm, phrase, tokens)
 	case valueTypeUint16:
-		matchUint16ByExactValue(bs, ch, bm, phrase, tokens)
+		return matchUint16ByExactValue(bs, ch, bm, phrase, tokens)
 	case valueTypeUint32:
-		matchUint32ByExactValue(bs, ch, bm, phrase, tokens)
+		return matchUint32ByExactValue(bs, ch, bm, phrase, tokens)
 	case valueTypeUint64:
-		matchUint64ByExactValue(bs, ch, bm, phrase, tokens)
+		return matchUint64ByExactValue(bs, ch, bm, phrase, tokens)
 	case valueTypeInt64:
-		matchInt64ByExactValue(bs, ch, bm, phrase, tokens)
+		return matchInt64ByExactValue(bs, ch, bm, phrase, tokens)
 	case valueTypeFloat64:
-		matchFloat64ByPhrase(bs, ch, bm, phrase, tokens)
+		return matchFloat64ByPhrase(bs, ch, bm, phrase, tokens)
 	case valueTypeIPv4:
-		matchIPv4ByPhrase(bs, ch, bm, phrase, tokens)
+		return matchIPv4ByPhrase(bs, ch, bm, phrase, tokens)
 	case valueTypeTimestampISO8601:
-		matchTimestampISO8601ByPhrase(bs, ch, bm, phrase, tokens)
+		return matchTimestampISO8601ByPhrase(bs, ch, bm, phrase, tokens)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
-func matchTimestampISO8601ByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string, tokens []uint64) {
+func matchTimestampISO8601ByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string, tokens []uint64) error {
 	_, ok := tryParseTimestampISO8601(phrase)
 	if ok {
 		// Fast path - the phrase contains complete timestamp, so we can use exact search
-		matchTimestampISO8601ByExactValue(bs, ch, bm, phrase, tokens)
-		return
+		return matchTimestampISO8601ByExactValue(bs, ch, bm, phrase, tokens)
 	}
 
 	// Slow path - the phrase contains incomplete timestamp. Search over string representation of the timestamp.
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toTimestampISO8601String(bs, bb, v)
 		return matchPhrase(s, phrase)
 	})
-	bbPool.Put(bb)
 }
 
-func matchIPv4ByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string, tokens []uint64) {
+func matchIPv4ByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string, tokens []uint64) error {
 	_, ok := tryParseIPv4(phrase)
 	if ok {
 		// Fast path - phrase contains the full IP address, so we can use exact matching
-		matchIPv4ByExactValue(bs, ch, bm, phrase, tokens)
-		return
+		return matchIPv4ByExactValue(bs, ch, bm, phrase, tokens)
 	}
 
 	// Slow path - the phrase may contain a part of IP address. For example, `1.23` should match `1.23.4.5` and `4.1.23.54`.
 	// We cannot compare binary representation of ip address and need converting
 	// the ip to string before searching for prefix there.
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toIPv4String(bs, bb, v)
 		return matchPhrase(s, phrase)
 	})
-	bbPool.Put(bb)
 }
 
-func matchFloat64ByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string, tokens []uint64) {
+func matchFloat64ByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string, tokens []uint64) error {
 	// The phrase may contain a part of the floating-point number.
 	// For example, `foo:"123"` must match `123`, `123.456` and `-0.123`.
 	// This means we cannot search in binary representation of floating-point numbers.
@@ -169,28 +170,29 @@ func matchFloat64ByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase 
 	_, ok := tryParseFloat64Exact(phrase)
 	if !ok && phrase != "." && phrase != "+" && phrase != "-" {
 		bm.resetBits()
-		return
+		return nil
 	}
 	if n := strings.IndexByte(phrase, '.'); n > 0 && n < len(phrase)-1 {
 		// Fast path - the phrase contains the exact floating-point number, so we can use exact search
-		matchFloat64ByExactValue(bs, ch, bm, phrase, tokens)
-		return
+		return matchFloat64ByExactValue(bs, ch, bm, phrase, tokens)
 	}
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toFloat64String(bs, bb, v)
 		return matchPhrase(s, phrase)
 	})
-	bbPool.Put(bb)
 }
 
-func matchValuesDictByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string) {
+func matchValuesDictByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string) error {
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 	for _, v := range ch.valuesDict.values {
 		c := byte(0)
 		if matchPhrase(v, phrase) {
@@ -198,16 +200,16 @@ func matchValuesDictByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phra
 		}
 		bb.B = append(bb.B, c)
 	}
-	matchEncodedValuesDict(bs, ch, bm, bb.B)
-	bbPool.Put(bb)
+	return matchEncodedValuesDict(bs, ch, bm, bb.B)
 }
 
-func matchStringByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchStringByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
-	visitValues(bs, ch, bm, func(v string) bool {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		return matchPhrase(v, phrase)
 	})
 }
@@ -273,14 +275,14 @@ func getPhrasePos(s, phrase string) int {
 	}
 }
 
-func matchEncodedValuesDict(bs *blockSearch, ch *columnHeader, bm *bitmap, encodedValues []byte) {
+func matchEncodedValuesDict(bs *blockSearch, ch *columnHeader, bm *bitmap, encodedValues []byte) error {
 	if bytes.IndexByte(encodedValues, 1) < 0 {
 		// Fast path - the phrase is missing in the valuesDict
 		bm.resetBits()
-		return
+		return nil
 	}
 	// Slow path - iterate over values
-	visitValues(bs, ch, bm, func(v string) bool {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		if len(v) != 1 {
 			logger.Panicf("FATAL: %s: unexpected length for dict value: got %d; want 1", bs.partPath(), len(v))
 		}
@@ -292,23 +294,30 @@ func matchEncodedValuesDict(bs *blockSearch, ch *columnHeader, bm *bitmap, encod
 	})
 }
 
-func visitValues(bs *blockSearch, ch *columnHeader, bm *bitmap, f func(value string) bool) {
+func visitValues(bs *blockSearch, ch *columnHeader, bm *bitmap, f func(value string) bool) error {
 	if bm.isZero() {
 		// Fast path - nothing to visit
-		return
+		return nil
 	}
-	values := bs.getValuesForColumn(ch)
+	values, err := bs.getValuesForColumn(ch)
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		return f(values[idx])
 	})
+	return nil
 }
 
-func matchBloomFilterAllTokens(bs *blockSearch, ch *columnHeader, tokens []uint64) bool {
+func matchBloomFilterAllTokens(bs *blockSearch, ch *columnHeader, tokens []uint64) (bool, error) {
 	if len(tokens) == 0 {
-		return true
+		return true, nil
 	}
-	bf := bs.getBloomFilterForColumn(ch)
-	return bf.containsAll(tokens)
+	bf, err := bs.getBloomFilterForColumn(ch)
+	if err != nil {
+		return false, err
+	}
+	return bf.containsAll(tokens), nil
 }
 
 func toFloat64String(bs *blockSearch, bb *bytesutil.ByteBuffer, v string) string {
@@ -338,25 +347,25 @@ func toTimestampISO8601String(bs *blockSearch, bb *bytesutil.ByteBuffer, v strin
 	return bytesutil.ToUnsafeString(bb.B)
 }
 
-func applyToBlockResultGeneric(br *blockResult, bm *bitmap, fieldName, phrase string, matchFunc func(v, phrase string) bool) {
+func applyToBlockResultGeneric(br *blockResult, bm *bitmap, fieldName, phrase string, matchFunc func(v, phrase string) bool) error {
 	c := br.getColumnByName(fieldName)
 	if c.isConst {
 		v := c.valuesEncoded[0]
 		if !matchFunc(v, phrase) {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 	if c.isTime {
-		matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
-		return
+		return matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
+		return matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range c.dictValues {
 			c := byte(0)
 			if matchFunc(v, phrase) {
@@ -364,61 +373,68 @@ func applyToBlockResultGeneric(br *blockResult, bm *bitmap, fieldName, phrase st
 			}
 			bb.B = append(bb.B, c)
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			n := valuesEncoded[idx][0]
 			return bb.B[n] == 1
 		})
-		bbPool.Put(bb)
 	case valueTypeUint8:
 		n, ok := tryParseUint64(phrase)
 		if !ok || n >= (1<<8) {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
+		return matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
 	case valueTypeUint16:
 		n, ok := tryParseUint64(phrase)
 		if !ok || n >= (1<<16) {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
+		return matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
 	case valueTypeUint32:
 		n, ok := tryParseUint64(phrase)
 		if !ok || n >= (1<<32) {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
+		return matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
 	case valueTypeUint64:
 		_, ok := tryParseUint64(phrase)
 		if !ok {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
+		return matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
 	case valueTypeInt64:
 		_, ok := tryParseInt64(phrase)
 		if !ok {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
+		return matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
 	case valueTypeFloat64:
-		matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
+		return matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
 	case valueTypeIPv4:
-		matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
+		return matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
 	case valueTypeTimestampISO8601:
-		matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
+		return matchColumnByPhraseGeneric(br, bm, c, phrase, matchFunc)
 	default:
 		logger.Panicf("FATAL: unknown valueType=%d", c.valueType)
 	}
+	return nil
 }
 
-func matchColumnByPhraseGeneric(br *blockResult, bm *bitmap, c *blockResultColumn, phrase string, matchFunc func(v, phrase string) bool) {
-	values := c.getValues(br)
+func matchColumnByPhraseGeneric(br *blockResult, bm *bitmap, c *blockResultColumn, phrase string, matchFunc func(v, phrase string) bool) error {
+	values, err := c.getValues(br)
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		return matchFunc(values[idx], phrase)
 	})
+	return nil
 }

@@ -18,7 +18,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/stringsutil"
 )
 
-func newPipeTopkProcessor(ps *pipeSort, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func newPipeTopkProcessor(ps *pipeSort, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	maxStateSize := int64(float64(memory.Allowed()) * 0.2)
 
 	ptp := &pipeTopkProcessor{
@@ -31,6 +31,7 @@ func newPipeTopkProcessor(ps *pipeSort, stopCh <-chan struct{}, cancel func(), p
 	}
 	ptp.shards.Init = func(shard *pipeTopkProcessorShard) {
 		shard.ps = ps
+		shard.ptp = ptp
 	}
 	ptp.stateSizeBudget.Store(maxStateSize)
 
@@ -40,7 +41,7 @@ func newPipeTopkProcessor(ps *pipeSort, stopCh <-chan struct{}, cancel func(), p
 type pipeTopkProcessor struct {
 	ps     *pipeSort
 	stopCh <-chan struct{}
-	cancel func()
+	cancel func(error)
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeTopkProcessorShard]
@@ -50,6 +51,8 @@ type pipeTopkProcessor struct {
 }
 
 type pipeTopkProcessorShard struct {
+	ptp *pipeTopkProcessor
+
 	// ps points to the parent pipeSort.
 	ps *pipeSort
 
@@ -191,7 +194,11 @@ func (shard *pipeTopkProcessorShard) writeBlock(br *blockResult) {
 
 		byColumnValues := shard.byColumnValues[:0]
 		for _, c := range cs {
-			values := c.getValues(br)
+			values, err := c.getValues(br)
+			if err != nil {
+				shard.ptp.cancel(err)
+				return
+			}
 			byColumnValues = append(byColumnValues, values)
 		}
 		shard.byColumnValues = byColumnValues
@@ -199,6 +206,7 @@ func (shard *pipeTopkProcessorShard) writeBlock(br *blockResult) {
 		byColumns := slicesutil.SetLength(shard.byColumns, 1)
 		byColumnsIsTime := slicesutil.SetLength(shard.byColumnsIsTime, 1)
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for rowIdx := range br.rowsLen {
 			bb.B = bb.B[:0]
 			for i, values := range byColumnValues {
@@ -209,9 +217,11 @@ func (shard *pipeTopkProcessorShard) writeBlock(br *blockResult) {
 			byColumns[0] = bytesutil.ToUnsafeString(bb.B)
 			byColumnsIsTime[0] = false
 
-			shard.addRow(br, byColumns, byColumnsIsTime, cs, rowIdx, 0)
+			if err := shard.addRow(br, byColumns, byColumnsIsTime, cs, rowIdx, 0); err != nil {
+				shard.ptp.cancel(err)
+				return
+			}
 		}
-		bbPool.Put(bb)
 		shard.byColumns = byColumns
 		shard.byColumnsIsTime = byColumnsIsTime
 	} else {
@@ -226,7 +236,12 @@ func (shard *pipeTopkProcessorShard) writeBlock(br *blockResult) {
 
 			var values []string
 			if !c.isTime {
-				values = c.getValues(br)
+				var err error
+				values, err = c.getValues(br)
+				if err != nil {
+					shard.ptp.cancel(err)
+					return
+				}
 			}
 			byColumnValues[i] = values
 		}
@@ -252,7 +267,12 @@ func (shard *pipeTopkProcessorShard) writeBlock(br *blockResult) {
 		byColumns := slicesutil.SetLength(shard.byColumns, len(byFields))
 		var timestamps []int64
 		if slices.Contains(byColumnsIsTime, true) {
-			timestamps = br.getTimestamps()
+			var err error
+			timestamps, err = br.getTimestamps()
+			if err != nil {
+				shard.ptp.cancel(err)
+				return
+			}
 		}
 		for rowIdx := range br.rowsLen {
 			for i, values := range byColumnValues {
@@ -268,17 +288,23 @@ func (shard *pipeTopkProcessorShard) writeBlock(br *blockResult) {
 				timestamp = timestamps[rowIdx]
 			}
 
-			shard.addRow(br, byColumns, byColumnsIsTime, csOther, rowIdx, timestamp)
+			if err := shard.addRow(br, byColumns, byColumnsIsTime, csOther, rowIdx, timestamp); err != nil {
+				shard.ptp.cancel(err)
+				return
+			}
 		}
 		shard.byColumns = byColumns
 	}
 }
 
-func (shard *pipeTopkProcessorShard) addRow(br *blockResult, byColumns []string, byColumnsIsTime []bool, csOther []*blockResultColumn, rowIdx int, timestamp int64) {
+func (shard *pipeTopkProcessorShard) addRow(br *blockResult, byColumns []string, byColumnsIsTime []bool, csOther []*blockResultColumn, rowIdx int, timestamp int64) error {
 	// Construct partition key
 	b := shard.partitionKey[:0]
 	for _, c := range shard.partitionColumns {
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return err
+		}
 		b = encoding.MarshalBytes(b, bytesutil.ToUnsafeBytes(v))
 	}
 	shard.partitionKey = b
@@ -291,7 +317,7 @@ func (shard *pipeTopkProcessorShard) addRow(br *blockResult, byColumns []string,
 	maxRows := shard.ps.offset + shard.ps.limit
 	if uint64(len(rs.rows)) >= maxRows && !topkLess(shard.ps, r, rs.rows[0]) {
 		// Fast path - nothing to add.
-		return
+		return nil
 	}
 
 	// Slow path - add r to rs.
@@ -299,7 +325,10 @@ func (shard *pipeTopkProcessorShard) addRow(br *blockResult, byColumns []string,
 	// Populate r.otherColumns
 	otherColumns := slicesutil.SetLength(shard.otherColumns, len(csOther))
 	for i, c := range csOther {
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return err
+		}
 		otherColumns[i] = Field{
 			Name:  c.name,
 			Value: v,
@@ -321,6 +350,7 @@ func (shard *pipeTopkProcessorShard) addRow(br *blockResult, byColumns []string,
 		rs.rows[0] = r
 		heap.Fix(rs, 0)
 	}
+	return nil
 }
 
 func (shard *pipeTopkProcessorShard) getRowsByPartition(partition string) *pipeTopkRows {
@@ -368,7 +398,7 @@ func (ptp *pipeTopkProcessor) writeBlock(workerID uint, br *blockResult) {
 			// The state size is too big. Stop processing data in order to avoid OOM crash.
 			if remaining+stateSizeBudgetChunk >= 0 {
 				// Notify worker goroutines to stop calling writeBlock() in order to save CPU time.
-				ptp.cancel()
+				ptp.cancel(nil)
 			}
 			return
 		}
@@ -378,19 +408,19 @@ func (ptp *pipeTopkProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.writeBlock(br)
 }
 
-func (ptp *pipeTopkProcessor) flush() error {
+func (ptp *pipeTopkProcessor) flush() {
 	if n := ptp.stateSizeBudget.Load(); n <= 0 {
-		return fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", ptp.ps.String(), ptp.maxStateSize/(1<<20))
+		ptp.cancel(fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", ptp.ps.String(), ptp.maxStateSize/(1<<20)))
 	}
 
 	if needStop(ptp.stopCh) {
-		return nil
+		return
 	}
 
 	// Sort every shard in parallel
 	shards := ptp.shards.All()
 	if len(shards) == 0 {
-		return nil
+		return
 	}
 
 	var wg sync.WaitGroup
@@ -402,7 +432,7 @@ func (ptp *pipeTopkProcessor) flush() error {
 	wg.Wait()
 
 	if needStop(ptp.stopCh) {
-		return nil
+		return
 	}
 
 	// Obtain all the partition keys
@@ -421,7 +451,7 @@ func (ptp *pipeTopkProcessor) flush() error {
 	// Merge sorted results across shards per each partitionKey
 	for _, k := range partitionKeys {
 		if needStop(ptp.stopCh) {
-			return nil
+			return
 		}
 		var rss []*pipeTopkRows
 		for _, shard := range shards {
@@ -432,8 +462,6 @@ func (ptp *pipeTopkProcessor) flush() error {
 		}
 		ptp.mergeAndFlushRows(rss)
 	}
-
-	return nil
 }
 
 func (ptp *pipeTopkProcessor) mergeAndFlushRows(rss []*pipeTopkRows) {

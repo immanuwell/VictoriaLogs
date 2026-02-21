@@ -62,7 +62,7 @@ func (pc *pipeBlocksCount) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pc *pipeBlocksCount) newPipeProcessor(_ int, stopCh <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pc *pipeBlocksCount) newPipeProcessor(_ int, stopCh <-chan struct{}, _ func(error), ppNext pipeProcessor) pipeProcessor {
 	pcp := &pipeBlocksCountProcessor{
 		pc:     pc,
 		stopCh: stopCh,
@@ -88,15 +88,15 @@ func (pcp *pipeBlocksCountProcessor) writeBlock(workerID uint, _ *blockResult) {
 	shard.blocksCount++
 }
 
-func (pcp *pipeBlocksCountProcessor) flush() error {
+func (pcp *pipeBlocksCountProcessor) flush() {
 	if needStop(pcp.stopCh) {
-		return nil
+		return
 	}
 
 	// merge state across shards
 	shards := pcp.shards.All()
 	if len(shards) == 0 {
-		return nil
+		return
 	}
 
 	blocksCount := shards[0].blocksCount
@@ -115,8 +115,6 @@ func (pcp *pipeBlocksCountProcessor) flush() error {
 	var br blockResult
 	br.setResultColumns(rcs[:], 1)
 	pcp.ppNext.writeBlock(0, &br)
-
-	return nil
 }
 
 func parsePipeBlocksCount(lex *lexer) (pipe, error) {

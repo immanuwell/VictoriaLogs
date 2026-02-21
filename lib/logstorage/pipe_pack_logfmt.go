@@ -60,8 +60,8 @@ func (pp *pipePackLogfmt) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pp *pipePackLogfmt) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
-	return newPipePackProcessor(ppNext, pp.resultField, pp.fieldFilters, MarshalFieldsToLogfmt)
+func (pp *pipePackLogfmt) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
+	return newPipePackProcessor(ppNext, cancel, pp.resultField, pp.fieldFilters, MarshalFieldsToLogfmt)
 }
 
 func parsePipePackLogfmt(lex *lexer) (pipe, error) {

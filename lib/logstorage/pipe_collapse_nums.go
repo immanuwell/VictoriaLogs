@@ -75,7 +75,7 @@ func (pc *pipeCollapseNums) initFilterInValues(cache *inValuesCache, getFieldVal
 	return &pcNew, nil
 }
 
-func (pc *pipeCollapseNums) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pc *pipeCollapseNums) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	updateFunc := func(a *arena, v string) string {
 		bLen := len(a.b)
 		a.b = appendCollapseNums(a.b, v)
@@ -85,7 +85,7 @@ func (pc *pipeCollapseNums) newPipeProcessor(_ int, _ <-chan struct{}, _ func(),
 		return bytesutil.ToUnsafeString(a.b[bLen:])
 	}
 
-	return newPipeUpdateProcessor(updateFunc, ppNext, pc.field, pc.iff)
+	return newPipeUpdateProcessor(cancel, updateFunc, ppNext, pc.field, pc.iff)
 }
 
 func parsePipeCollapseNums(lex *lexer) (pipe, error) {

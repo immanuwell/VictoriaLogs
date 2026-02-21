@@ -101,10 +101,11 @@ func (pe *pipeExtract) updateNeededFields(pf *prefixfilter.Filter) {
 	}
 }
 
-func (pe *pipeExtract) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pe *pipeExtract) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeExtractProcessor{
 		pe:     pe,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -113,6 +114,7 @@ type pipeExtractProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeExtractProcessorShard]
+	cancel func(error)
 }
 
 type pipeExtractProcessorShard struct {
@@ -138,7 +140,10 @@ func (pep *pipeExtractProcessor) writeBlock(workerID uint, br *blockResult) {
 	if iff := pe.iff; iff != nil {
 		bm.init(br.rowsLen)
 		bm.setBits()
-		iff.f.applyToBlockResult(br, bm)
+		if err := iff.f.applyToBlockResult(br, bm); err != nil {
+			pep.cancel(err)
+			return
+		}
 		if bm.isZero() {
 			pep.ppNext.writeBlock(workerID, br)
 			return
@@ -157,7 +162,11 @@ func (pep *pipeExtractProcessor) writeBlock(workerID uint, br *blockResult) {
 	}
 
 	c := br.getColumnByName(pe.fromField)
-	values := c.getValues(br)
+	values, err := c.getValues(br)
+	if err != nil {
+		pep.cancel(err)
+		return
+	}
 
 	shard.resultColumns = slicesutil.SetLength(shard.resultColumns, len(rcs))
 	resultColumns := shard.resultColumns
@@ -182,7 +191,10 @@ func (pep *pipeExtractProcessor) writeBlock(workerID uint, br *blockResult) {
 					v := *f.value
 					if v == "" && pe.skipEmptyResults || pe.keepOriginalFields {
 						c := resultColumns[i]
-						if vOrig := c.getValueAtRow(br, rowIdx); vOrig != "" {
+						if vOrig, err := c.getValueAtRow(br, rowIdx); err != nil {
+							pep.cancel(err)
+							return
+						} else if vOrig != "" {
 							v = vOrig
 						}
 					} else {
@@ -193,7 +205,11 @@ func (pep *pipeExtractProcessor) writeBlock(workerID uint, br *blockResult) {
 			}
 		} else {
 			for i, c := range resultColumns {
-				resultValues[i] = c.getValueAtRow(br, rowIdx)
+				resultValues[i], err = c.getValueAtRow(br, rowIdx)
+				if err != nil {
+					pep.cancel(err)
+					return
+				}
 			}
 			needUpdates = true
 		}
@@ -214,9 +230,7 @@ func (pep *pipeExtractProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.a.reset()
 }
 
-func (pep *pipeExtractProcessor) flush() error {
-	return nil
-}
+func (pep *pipeExtractProcessor) flush() {}
 
 func parsePipeExtract(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("extract") {

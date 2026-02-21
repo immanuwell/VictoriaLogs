@@ -35,13 +35,13 @@ func (fr *filterRange) matchRowByField(fields []Field, fieldName string) bool {
 	return matchRange(v, fr.minValue, fr.maxValue)
 }
 
-func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	minValue := fr.minValue
 	maxValue := fr.maxValue
 
 	if minValue > maxValue {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	c := br.getColumnByName(fieldName)
@@ -50,27 +50,34 @@ func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fi
 		if !matchRange(v, minValue, maxValue) {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 	if c.isTime {
-		timestamps := br.getTimestamps()
+		timestamps, err := br.getTimestamps()
+		if err != nil {
+			return err
+		}
 		minValueInt, maxValueInt := toInt64Range(minValue, maxValue)
 		bm.forEachSetBit(func(idx int) bool {
 			timestamp := timestamps[idx]
 			return timestamp >= minValueInt && timestamp <= maxValueInt
 		})
-		return
+		return nil
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := values[idx]
 			return matchRange(v, minValue, maxValue)
 		})
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range c.dictValues {
 			c := byte(0)
 			if matchRange(v, minValue, maxValue) {
@@ -78,19 +85,24 @@ func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fi
 			}
 			bb.B = append(bb.B, c)
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			n := valuesEncoded[idx][0]
 			return bb.B[n] == 1
 		})
-		bbPool.Put(bb)
 	case valueTypeUint8:
 		minValueUint, maxValueUint := toUint64Range(minValue, maxValue)
 		if maxValue < 0 || minValueUint > c.maxValue || maxValueUint < c.minValue {
 			bm.resetBits()
-			return
+			return nil
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := valuesEncoded[idx]
 			n := uint64(unmarshalUint8(v))
@@ -100,9 +112,12 @@ func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fi
 		minValueUint, maxValueUint := toUint64Range(minValue, maxValue)
 		if maxValue < 0 || minValueUint > c.maxValue || maxValueUint < c.minValue {
 			bm.resetBits()
-			return
+			return nil
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := valuesEncoded[idx]
 			n := uint64(unmarshalUint16(v))
@@ -112,9 +127,12 @@ func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fi
 		minValueUint, maxValueUint := toUint64Range(minValue, maxValue)
 		if maxValue < 0 || minValueUint > c.maxValue || maxValueUint < c.minValue {
 			bm.resetBits()
-			return
+			return nil
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := valuesEncoded[idx]
 			n := uint64(unmarshalUint32(v))
@@ -124,9 +142,12 @@ func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fi
 		minValueUint, maxValueUint := toUint64Range(minValue, maxValue)
 		if maxValue < 0 || minValueUint > c.maxValue || maxValueUint < c.minValue {
 			bm.resetBits()
-			return
+			return nil
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := valuesEncoded[idx]
 			n := unmarshalUint64(v)
@@ -136,9 +157,12 @@ func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fi
 		minValueInt, maxValueInt := toInt64Range(minValue, maxValue)
 		if minValueInt > int64(c.maxValue) || maxValueInt < int64(c.minValue) {
 			bm.resetBits()
-			return
+			return nil
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := valuesEncoded[idx]
 			n := unmarshalInt64(v)
@@ -147,9 +171,12 @@ func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fi
 	case valueTypeFloat64:
 		if minValue > math.Float64frombits(c.maxValue) || maxValue < math.Float64frombits(c.minValue) {
 			bm.resetBits()
-			return
+			return nil
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := valuesEncoded[idx]
 			f := unmarshalFloat64(v)
@@ -159,9 +186,12 @@ func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fi
 		minValueUint32, maxValueUint32 := toUint32Range(minValue, maxValue)
 		if maxValue < 0 || uint64(minValueUint32) > c.maxValue || uint64(maxValueUint32) < c.minValue {
 			bm.resetBits()
-			return
+			return nil
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := valuesEncoded[idx]
 			n := unmarshalIPv4(v)
@@ -171,9 +201,12 @@ func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fi
 		minValueInt, maxValueInt := toInt64Range(minValue, maxValue)
 		if maxValue < 0 || minValueInt > int64(c.maxValue) || maxValueInt < int64(c.minValue) {
 			bm.resetBits()
-			return
+			return nil
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := valuesEncoded[idx]
 			n := unmarshalTimestampISO8601(v)
@@ -182,67 +215,69 @@ func (fr *filterRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fi
 	default:
 		logger.Panicf("FATAL: unknown valueType=%d", c.valueType)
 	}
+	return nil
 }
 
-func (fr *filterRange) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fr *filterRange) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	minValue := fr.minValue
 	maxValue := fr.maxValue
 
 	if minValue > maxValue {
 		bm.resetBits()
-		return
+		return nil
 	}
 
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if !matchRange(v, minValue, maxValue) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether filter matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		// Fast path - there are no matching columns.
 		bm.resetBits()
-		return
+		return err
 	}
 
 	switch ch.valueType {
 	case valueTypeString:
-		matchStringByRange(bs, ch, bm, minValue, maxValue)
+		return matchStringByRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeDict:
-		matchValuesDictByRange(bs, ch, bm, minValue, maxValue)
+		return matchValuesDictByRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeUint8:
-		matchUint8ByRange(bs, ch, bm, minValue, maxValue)
+		return matchUint8ByRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeUint16:
-		matchUint16ByRange(bs, ch, bm, minValue, maxValue)
+		return matchUint16ByRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeUint32:
-		matchUint32ByRange(bs, ch, bm, minValue, maxValue)
+		return matchUint32ByRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeUint64:
-		matchUint64ByRange(bs, ch, bm, minValue, maxValue)
+		return matchUint64ByRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeInt64:
-		matchInt64ByRange(bs, ch, bm, minValue, maxValue)
+		return matchInt64ByRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeFloat64:
-		matchFloat64ByRange(bs, ch, bm, minValue, maxValue)
+		return matchFloat64ByRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeIPv4:
 		minValueUint32, maxValueUint32 := toUint32Range(minValue, maxValue)
-		matchIPv4ByRange(bs, ch, bm, minValueUint32, maxValueUint32)
+		return matchIPv4ByRange(bs, ch, bm, minValueUint32, maxValueUint32)
 	case valueTypeTimestampISO8601:
-		matchTimestampISO8601ByRange(bs, ch, bm, minValue, maxValue)
+		return matchTimestampISO8601ByRange(bs, ch, bm, minValue, maxValue)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
-func matchFloat64ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) {
+func matchFloat64ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) error {
 	if minValue > math.Float64frombits(ch.maxValue) || maxValue < math.Float64frombits(ch.minValue) {
 		bm.resetBits()
-		return
+		return nil
 	}
 
-	visitValues(bs, ch, bm, func(v string) bool {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		if len(v) != 8 {
 			logger.Panicf("FATAL: %s: unexpected length for binary representation of floating-point number: got %d; want 8", bs.partPath(), len(v))
 		}
@@ -251,8 +286,9 @@ func matchFloat64ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue
 	})
 }
 
-func matchValuesDictByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) {
+func matchValuesDictByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) error {
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 	for _, v := range ch.valuesDict.values {
 		c := byte(0)
 		if matchRange(v, minValue, maxValue) {
@@ -260,116 +296,115 @@ func matchValuesDictByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minVa
 		}
 		bb.B = append(bb.B, c)
 	}
-	matchEncodedValuesDict(bs, ch, bm, bb.B)
-	bbPool.Put(bb)
+	return matchEncodedValuesDict(bs, ch, bm, bb.B)
 }
 
-func matchStringByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) {
-	visitValues(bs, ch, bm, func(v string) bool {
+func matchStringByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) error {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		return matchRange(v, minValue, maxValue)
 	})
 }
 
-func matchUint8ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) {
+func matchUint8ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) error {
 	minValueUint, maxValueUint := toUint64Range(minValue, maxValue)
 	if maxValue < 0 || minValueUint > ch.maxValue || maxValueUint < ch.minValue {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		if len(v) != 1 {
 			logger.Panicf("FATAL: %s: unexpected length for binary representation of uint8 number: got %d; want 1", bs.partPath(), len(v))
 		}
 		n := uint64(unmarshalUint8(v))
 		return n >= minValueUint && n <= maxValueUint
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint16ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) {
+func matchUint16ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) error {
 	minValueUint, maxValueUint := toUint64Range(minValue, maxValue)
 	if maxValue < 0 || minValueUint > ch.maxValue || maxValueUint < ch.minValue {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		if len(v) != 2 {
 			logger.Panicf("FATAL: %s: unexpected length for binary representation of uint16 number: got %d; want 2", bs.partPath(), len(v))
 		}
 		n := uint64(unmarshalUint16(v))
 		return n >= minValueUint && n <= maxValueUint
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint32ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) {
+func matchUint32ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) error {
 	minValueUint, maxValueUint := toUint64Range(minValue, maxValue)
 	if maxValue < 0 || minValueUint > ch.maxValue || maxValueUint < ch.minValue {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		if len(v) != 4 {
 			logger.Panicf("FATAL: %s: unexpected length for binary representation of uint32 number: got %d; want 4", bs.partPath(), len(v))
 		}
 		n := uint64(unmarshalUint32(v))
 		return n >= minValueUint && n <= maxValueUint
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint64ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) {
+func matchUint64ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) error {
 	minValueUint, maxValueUint := toUint64Range(minValue, maxValue)
 	if maxValue < 0 || minValueUint > ch.maxValue || maxValueUint < ch.minValue {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		if len(v) != 8 {
 			logger.Panicf("FATAL: %s: unexpected length for binary representation of uint64 number: got %d; want 8", bs.partPath(), len(v))
 		}
 		n := unmarshalUint64(v)
 		return n >= minValueUint && n <= maxValueUint
 	})
-	bbPool.Put(bb)
 }
 
-func matchInt64ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) {
+func matchInt64ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) error {
 	minValueInt, maxValueInt := toInt64Range(minValue, maxValue)
 	if minValueInt > int64(ch.maxValue) || maxValueInt < int64(ch.minValue) {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		if len(v) != 8 {
 			logger.Panicf("FATAL: %s: unexpected length for binary representation of int64 number; got %d; want 8", bs.partPath(), len(v))
 		}
 		n := unmarshalInt64(v)
 		return n >= minValueInt && n <= maxValueInt
 	})
-	bbPool.Put(bb)
 }
 
-func matchTimestampISO8601ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) {
+func matchTimestampISO8601ByRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue float64) error {
 	minValueInt, maxValueInt := toInt64Range(minValue, maxValue)
 	if maxValue < 0 || minValueInt > int64(ch.maxValue) || maxValueInt < int64(ch.minValue) {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		if len(v) != 8 {
 			logger.Panicf("FATAL: %s: unexpected length for binary representation of timestampISO8601: got %d; want 8", bs.partPath(), len(v))
 		}
 		n := unmarshalTimestampISO8601(v)
 		return n >= minValueInt && n <= maxValueInt
 	})
-	bbPool.Put(bb)
 }
 
 func matchRange(s string, minValue, maxValue float64) bool {

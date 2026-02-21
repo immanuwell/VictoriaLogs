@@ -55,14 +55,14 @@ func (pd *pipeDecolorize) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pd *pipeDecolorize) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pd *pipeDecolorize) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	updateFunc := func(a *arena, v string) string {
 		bLen := len(a.b)
 		a.b = dropColorSequences(a.b, v)
 		return bytesutil.ToUnsafeString(a.b[bLen:])
 	}
 
-	return newPipeUpdateProcessor(updateFunc, ppNext, pd.field, nil)
+	return newPipeUpdateProcessor(cancel, updateFunc, ppNext, pd.field, nil)
 }
 
 func parsePipeDecolorize(lex *lexer) (pipe, error) {

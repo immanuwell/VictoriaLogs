@@ -81,104 +81,109 @@ func (fr *filterRegexp) matchRowByField(fields []Field, fieldName string) bool {
 	return fr.re.MatchString(v)
 }
 
-func (fr *filterRegexp) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fr *filterRegexp) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	re := fr.re
-	applyToBlockResultGeneric(br, bm, fieldName, "", func(v, _ string) bool {
+	return applyToBlockResultGeneric(br, bm, fieldName, "", func(v, _ string) bool {
 		return re.MatchString(v)
 	})
 }
 
-func (fr *filterRegexp) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fr *filterRegexp) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	re := fr.re
 
 	// Verify whether filter matches const column
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if !re.MatchString(v) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether filter matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		// Fast path - there are no matching columns.
 		if !re.MatchString("") {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	tokens := fr.getTokensHashes()
 
 	switch ch.valueType {
 	case valueTypeString:
-		matchStringByRegexp(bs, ch, bm, re, tokens)
+		return matchStringByRegexp(bs, ch, bm, re, tokens)
 	case valueTypeDict:
-		matchValuesDictByRegexp(bs, ch, bm, re)
+		return matchValuesDictByRegexp(bs, ch, bm, re)
 	case valueTypeUint8:
-		matchUint8ByRegexp(bs, ch, bm, re, tokens)
+		return matchUint8ByRegexp(bs, ch, bm, re, tokens)
 	case valueTypeUint16:
-		matchUint16ByRegexp(bs, ch, bm, re, tokens)
+		return matchUint16ByRegexp(bs, ch, bm, re, tokens)
 	case valueTypeUint32:
-		matchUint32ByRegexp(bs, ch, bm, re, tokens)
+		return matchUint32ByRegexp(bs, ch, bm, re, tokens)
 	case valueTypeUint64:
-		matchUint64ByRegexp(bs, ch, bm, re, tokens)
+		return matchUint64ByRegexp(bs, ch, bm, re, tokens)
 	case valueTypeInt64:
-		matchInt64ByRegexp(bs, ch, bm, re, tokens)
+		return matchInt64ByRegexp(bs, ch, bm, re, tokens)
 	case valueTypeFloat64:
-		matchFloat64ByRegexp(bs, ch, bm, re, tokens)
+		return matchFloat64ByRegexp(bs, ch, bm, re, tokens)
 	case valueTypeIPv4:
-		matchIPv4ByRegexp(bs, ch, bm, re, tokens)
+		return matchIPv4ByRegexp(bs, ch, bm, re, tokens)
 	case valueTypeTimestampISO8601:
-		matchTimestampISO8601ByRegexp(bs, ch, bm, re, tokens)
+		return matchTimestampISO8601ByRegexp(bs, ch, bm, re, tokens)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
-func matchTimestampISO8601ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchTimestampISO8601ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toTimestampISO8601String(bs, bb, v)
 		return re.MatchString(s)
 	})
-	bbPool.Put(bb)
 }
 
-func matchIPv4ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchIPv4ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toIPv4String(bs, bb, v)
 		return re.MatchString(s)
 	})
-	bbPool.Put(bb)
 }
 
-func matchFloat64ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchFloat64ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toFloat64String(bs, bb, v)
 		return re.MatchString(s)
 	})
-	bbPool.Put(bb)
 }
 
-func matchValuesDictByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex) {
+func matchValuesDictByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex) error {
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 	for _, v := range ch.valuesDict.values {
 		c := byte(0)
 		if re.MatchString(v) {
@@ -186,81 +191,86 @@ func matchValuesDictByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *
 		}
 		bb.B = append(bb.B, c)
 	}
-	matchEncodedValuesDict(bs, ch, bm, bb.B)
-	bbPool.Put(bb)
+	return matchEncodedValuesDict(bs, ch, bm, bb.B)
 }
 
-func matchStringByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchStringByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
-	visitValues(bs, ch, bm, func(v string) bool {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		return re.MatchString(v)
 	})
 }
 
-func matchUint8ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchUint8ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint8String(bs, bb, v)
 		return re.MatchString(s)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint16ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchUint16ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint16String(bs, bb, v)
 		return re.MatchString(s)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint32ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchUint32ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint32String(bs, bb, v)
 		return re.MatchString(s)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint64ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchUint64ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint64String(bs, bb, v)
 		return re.MatchString(s)
 	})
-	bbPool.Put(bb)
 }
 
-func matchInt64ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchInt64ByRegexp(bs *blockSearch, ch *columnHeader, bm *bitmap, re *regexutil.Regex, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toInt64String(bs, bb, v)
 		return re.MatchString(s)
 	})
-	bbPool.Put(bb)
 }

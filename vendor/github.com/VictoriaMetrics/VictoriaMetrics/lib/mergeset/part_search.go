@@ -310,9 +310,11 @@ func (ps *partSearch) nextBHS() error {
 
 func (ps *partSearch) readIndexBlock(mr *metaindexRow) (*indexBlock, error) {
 	ps.compressedIndexBuf = bytesutil.ResizeNoCopyMayOverallocate(ps.compressedIndexBuf, int(mr.indexBlockSize))
-	ps.p.indexFile.MustReadAt(ps.compressedIndexBuf, int64(mr.indexBlockOffset))
+	err := ps.p.indexFile.ReadAt(ps.compressedIndexBuf, int64(mr.indexBlockOffset))
+	if err != nil {
+		return nil, fmt.Errorf("cannot read index data: %w", err)
+	}
 
-	var err error
 	ps.indexBuf, err = encoding.DecompressZSTD(ps.indexBuf[:0], ps.compressedIndexBuf)
 	if err != nil {
 		return nil, fmt.Errorf("cannot decompress index block: %w", err)
@@ -364,10 +366,14 @@ func (ps *partSearch) readInmemoryBlock(bh *blockHeader) (*inmemoryBlock, error)
 	ps.sb.Reset()
 
 	ps.sb.itemsData = bytesutil.ResizeNoCopyMayOverallocate(ps.sb.itemsData, int(bh.itemsBlockSize))
-	ps.p.itemsFile.MustReadAt(ps.sb.itemsData, int64(bh.itemsBlockOffset))
+	if err := ps.p.itemsFile.ReadAt(ps.sb.itemsData, int64(bh.itemsBlockOffset)); err != nil {
+		return nil, fmt.Errorf("cannot read items data: %w", err)
+	}
 
 	ps.sb.lensData = bytesutil.ResizeNoCopyMayOverallocate(ps.sb.lensData, int(bh.lensBlockSize))
-	ps.p.lensFile.MustReadAt(ps.sb.lensData, int64(bh.lensBlockOffset))
+	if err := ps.p.lensFile.ReadAt(ps.sb.lensData, int64(bh.lensBlockOffset)); err != nil {
+		return nil, fmt.Errorf("cannot read lens data: %w", err)
+	}
 
 	ps.tmpIB.Reset()
 	ib := ps.tmpIB

@@ -42,10 +42,10 @@ func (ft *filterTime) matchRow(fields []Field) bool {
 	return ft.matchTimestampString(v)
 }
 
-func (ft *filterTime) applyToBlockResult(br *blockResult, bm *bitmap) {
+func (ft *filterTime) applyToBlockResult(br *blockResult, bm *bitmap) error {
 	if ft.minTimestamp > ft.maxTimestamp {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	c := br.getColumnByName("_time")
@@ -54,26 +54,33 @@ func (ft *filterTime) applyToBlockResult(br *blockResult, bm *bitmap) {
 		if !ft.matchTimestampString(v) {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 	if c.isTime {
-		timestamps := br.getTimestamps()
+		timestamps, err := br.getTimestamps()
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			timestamp := timestamps[idx]
 			return ft.matchTimestampValue(timestamp)
 		})
-		return
+		return nil
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := values[idx]
 			return ft.matchTimestampString(v)
 		})
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range c.dictValues {
 			c := byte(0)
 			if ft.matchTimestampString(v) {
@@ -81,12 +88,14 @@ func (ft *filterTime) applyToBlockResult(br *blockResult, bm *bitmap) {
 			}
 			bb.B = append(bb.B, c)
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			n := valuesEncoded[idx][0]
 			return bb.B[n] == 1
 		})
-		bbPool.Put(bb)
 	case valueTypeUint8:
 		bm.resetBits()
 	case valueTypeUint16:
@@ -102,7 +111,10 @@ func (ft *filterTime) applyToBlockResult(br *blockResult, bm *bitmap) {
 	case valueTypeIPv4:
 		bm.resetBits()
 	case valueTypeTimestampISO8601:
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := valuesEncoded[idx]
 			timestamp := unmarshalTimestampISO8601(v)
@@ -111,6 +123,7 @@ func (ft *filterTime) applyToBlockResult(br *blockResult, bm *bitmap) {
 	default:
 		logger.Panicf("FATAL: unknown valueType=%d", c.valueType)
 	}
+	return nil
 }
 
 func (ft *filterTime) matchTimestampString(v string) bool {
@@ -125,27 +138,31 @@ func (ft *filterTime) matchTimestampValue(timestamp int64) bool {
 	return timestamp >= ft.minTimestamp && timestamp <= ft.maxTimestamp
 }
 
-func (ft *filterTime) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
+func (ft *filterTime) applyToBlockSearch(bs *blockSearch, bm *bitmap) error {
 	minTimestamp := ft.minTimestamp
 	maxTimestamp := ft.maxTimestamp
 
 	if minTimestamp > maxTimestamp {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	th := bs.bsw.bh.timestampsHeader
 	if minTimestamp > th.maxTimestamp || maxTimestamp < th.minTimestamp {
 		bm.resetBits()
-		return
+		return nil
 	}
 	if minTimestamp <= th.minTimestamp && maxTimestamp >= th.maxTimestamp {
-		return
+		return nil
 	}
 
-	timestamps := bs.getTimestamps()
+	timestamps, err := bs.getTimestamps()
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		ts := timestamps[idx]
 		return ts >= minTimestamp && ts <= maxTimestamp
 	})
+	return nil
 }

@@ -293,6 +293,7 @@ func TestStorageProcessDeleteTask(t *testing.T) {
 
 	path := t.Name()
 	ctx := t.Context()
+	cancel := func(_ error) {}
 
 	cfg := &StorageConfig{
 		Retention: 30 * 24 * time.Hour,
@@ -309,7 +310,9 @@ func TestStorageProcessDeleteTask(t *testing.T) {
 	deleteRows := func(tenantIDs []TenantID, filters string) {
 		t.Helper()
 		dt := newDeleteTask("task_id_x", now, tenantIDs, filters)
-		for !s.processDeleteTask(ctx, dt) {
+		dt.ctx = ctx
+		dt.cancel = cancel
+		for !s.processDeleteTask(dt) {
 			// Unsuccessful attempt because of concurrently executed background merges.
 			// Wait for a bit and try again.
 			time.Sleep(10 * time.Millisecond)
@@ -409,7 +412,6 @@ func TestStorageProcessDeleteTaskRelativeTimeUsesTaskStartTime(t *testing.T) {
 	t.Parallel()
 
 	path := t.Name()
-	ctx := t.Context()
 
 	cfg := &StorageConfig{
 		Retention:       30 * 24 * time.Hour,
@@ -450,7 +452,8 @@ func TestStorageProcessDeleteTaskRelativeTimeUsesTaskStartTime(t *testing.T) {
 	check(`row_id:=1 | stats count(*) as rows`, []string{`{"rows":"1"}`})
 
 	dt := newDeleteTask("task_id_relative", now, tenantIDs, `_time:1s row_id:=1`)
-	for !s.processDeleteTask(ctx, dt) {
+	dt.ctx = t.Context()
+	for !s.processDeleteTask(dt) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -469,8 +472,9 @@ func checkQueryResults(t *testing.T, s *Storage, now int64, tenantIDs []TenantID
 	}
 
 	ctx := t.Context()
+	cancel := func(_ error) {}
 	var qs QueryStats
-	qctx := NewQueryContext(ctx, &qs, tenantIDs, q, false, hiddenFieldsFilters)
+	qctx := NewQueryContext(ctx, cancel, &qs, tenantIDs, q, false, hiddenFieldsFilters)
 
 	var buf []byte
 	var bufLock sync.Mutex
@@ -576,8 +580,8 @@ func TestStorageDropStalePartitions(t *testing.T) {
 	expectPartitionsNumber := func(n int) {
 		t.Helper()
 
-		pws := s.getPartitions()
-		defer s.putPartitions(pws)
+		pws := s.getWritePartitions()
+		defer s.putWritePartitions(pws)
 
 		if len(pws) != n {
 			t.Fatalf("unexpected number of partitions; got %d; want %d", len(pws), n)

@@ -1,6 +1,7 @@
 package logstorage
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
@@ -208,7 +209,7 @@ func (bs *blockSearch) partPath() string {
 	return bs.bsw.p.path
 }
 
-func (bs *blockSearch) search(qs *QueryStats, bsw *blockSearchWork, bm *bitmap) {
+func (bs *blockSearch) search(qs *QueryStats, bsw *blockSearchWork, bm *bitmap) error {
 	bs.reset()
 
 	bs.qs = qs
@@ -217,17 +218,19 @@ func (bs *blockSearch) search(qs *QueryStats, bsw *blockSearchWork, bm *bitmap) 
 	// search rows matching the given filter
 	bm.init(int(bsw.bh.rowsCount))
 	bm.setBits()
-	bs.bsw.pso.filter.applyToBlockSearch(bs, bm)
+	if err := bs.bsw.pso.filter.applyToBlockSearch(bs, bm); err != nil {
+		return err
+	}
 
 	if bm.isZero() {
 		// The filter doesn't match any logs in the current block.
-		return
+		return nil
 	}
 
 	bs.br.mustInit(bs, bm)
 
 	// fetch the requested columns to bs.br.
-	bs.br.initColumns(bsw.pso.fieldsFilter)
+	return bs.br.initColumns(bsw.pso.fieldsFilter)
 }
 
 func (bs *blockSearch) partFormatVersion() uint {
@@ -238,40 +241,49 @@ func (bs *blockSearch) isHiddenField(name string) bool {
 	return bs.bsw.pso.hiddenFieldsFilter.MatchString(name)
 }
 
-func (bs *blockSearch) getConstColumnValue(name string) string {
+func (bs *blockSearch) getConstColumnValue(name string) (string, error) {
 	name = getCanonicalFieldName(name)
 	if bs.isHiddenField(name) {
-		return ""
+		return "", nil
 	}
 
 	if bs.partFormatVersion() < 1 {
-		csh := bs.getColumnsHeader()
+		csh, err := bs.getColumnsHeader()
+		if err != nil {
+			return "", err
+		}
 		for _, cc := range csh.constColumns {
 			if cc.Name == name {
-				return cc.Value
+				return cc.Value, nil
 			}
 		}
-		return ""
+		return "", nil
 	}
 
 	columnNameID, ok := bs.getColumnNameID(name)
 	if !ok {
-		return ""
+		return "", nil
 	}
 
 	for i := range bs.ccsCache {
 		if bs.ccsCache[i].Name == name {
-			return bs.ccsCache[i].Value
+			return bs.ccsCache[i].Value, nil
 		}
 	}
 
-	cshIndex := bs.getColumnsHeaderIndex()
+	cshIndex, err := bs.getColumnsHeaderIndex()
+	if err != nil {
+		return "", err
+	}
 	for _, cr := range cshIndex.constColumnsRefs {
 		if cr.columnNameID != columnNameID {
 			continue
 		}
 
-		b := bs.getColumnsHeaderBlock()
+		b, err := bs.getColumnsHeaderBlock()
+		if err != nil {
+			return "", err
+		}
 		if cr.offset > uint64(len(b)) {
 			logger.Panicf("FATAL: %s: header offset for const column %q cannot exceed %d bytes; got %d bytes", bs.bsw.p.path, name, len(b), cr.offset)
 		}
@@ -282,47 +294,56 @@ func (bs *blockSearch) getConstColumnValue(name string) string {
 			logger.Panicf("FATAL: %s: cannot unmarshal header for const column %q: %s", bs.bsw.p.path, name, err)
 		}
 		cc.Name = bs.getColumnNameByID(columnNameID)
-		return cc.Value
+		return cc.Value, nil
 	}
-	return ""
+	return "", nil
 }
 
-func (bs *blockSearch) getColumnHeader(name string) *columnHeader {
+func (bs *blockSearch) getColumnHeader(name string) (*columnHeader, error) {
 	name = getCanonicalFieldName(name)
 	if bs.isHiddenField(name) {
-		return nil
+		return nil, nil
 	}
 
 	if bs.partFormatVersion() < 1 {
-		csh := bs.getColumnsHeader()
+		csh, err := bs.getColumnsHeader()
+		if err != nil {
+			return nil, err
+		}
 		chs := csh.columnHeaders
 		for i := range chs {
 			ch := &chs[i]
 			if ch.name == name {
-				return ch
+				return ch, nil
 			}
 		}
-		return nil
+		return nil, nil
 	}
 
 	columnNameID, ok := bs.getColumnNameID(name)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	for i := range bs.chsCache {
 		if bs.chsCache[i].name == name {
-			return &bs.chsCache[i]
+			return &bs.chsCache[i], nil
 		}
 	}
 
-	cshIndex := bs.getColumnsHeaderIndex()
+	cshIndex, err := bs.getColumnsHeaderIndex()
+	if err != nil {
+		return nil, err
+	}
 	for _, cr := range cshIndex.columnHeadersRefs {
 		if cr.columnNameID != columnNameID {
 			continue
 		}
 
-		b := bs.getColumnsHeaderBlock()
+		b, err := bs.getColumnsHeaderBlock()
+		if err != nil {
+			return nil, err
+		}
 		if cr.offset > uint64(len(b)) {
 			logger.Panicf("FATAL: %s: header offset for column %q cannot exceed %d bytes; got %d bytes", bs.bsw.p.path, name, len(b), cr.offset)
 		}
@@ -333,9 +354,9 @@ func (bs *blockSearch) getColumnHeader(name string) *columnHeader {
 			logger.Panicf("FATAL: %s: cannot unmarshal header for column %q: %s", bs.bsw.p.path, name, err)
 		}
 		ch.name = bs.getColumnNameByID(columnNameID)
-		return ch
+		return ch, nil
 	}
-	return nil
+	return nil, nil
 }
 
 func (bs *blockSearch) getColumnNameID(name string) (uint64, bool) {
@@ -351,25 +372,32 @@ func (bs *blockSearch) getColumnNameByID(columnNameID uint64) string {
 	return columnNames[columnNameID]
 }
 
-func (bs *blockSearch) getColumnsHeaderIndex() *columnsHeaderIndex {
+func (bs *blockSearch) getColumnsHeaderIndex() (*columnsHeaderIndex, error) {
 	if bs.partFormatVersion() < 1 {
 		logger.Panicf("BUG: getColumnsHeaderIndex() can be called only for part encoding v1+, while it has been called for v%d", bs.partFormatVersion())
 	}
 
 	if bs.cshIndexCache == nil {
-		bs.cshIndexBlockCache = readColumnsHeaderIndexBlock(bs.cshIndexBlockCache[:0], bs.bsw.p, &bs.bsw.bh, bs.qs)
+		var err error
+		bs.cshIndexBlockCache, err = readColumnsHeaderIndexBlock(bs.cshIndexBlockCache[:0], bs.bsw.p, &bs.bsw.bh, bs.qs)
+		if err != nil {
+			return nil, err
+		}
 
 		bs.cshIndexCache = getColumnsHeaderIndex()
 		if err := bs.cshIndexCache.unmarshalInplace(bs.cshIndexBlockCache); err != nil {
 			logger.Panicf("FATAL: %s: cannot unmarshal columns header index: %s", bs.bsw.p.path, err)
 		}
 	}
-	return bs.cshIndexCache
+	return bs.cshIndexCache, nil
 }
 
-func (bs *blockSearch) getColumnsHeader() *columnsHeader {
+func (bs *blockSearch) getColumnsHeader() (*columnsHeader, error) {
 	if bs.cshCache == nil {
-		b := bs.getColumnsHeaderBlock()
+		b, err := bs.getColumnsHeaderBlock()
+		if err != nil {
+			return nil, err
+		}
 
 		csh := getColumnsHeader()
 		partFormatVersion := bs.partFormatVersion()
@@ -377,7 +405,10 @@ func (bs *blockSearch) getColumnsHeader() *columnsHeader {
 			logger.Panicf("FATAL: %s: cannot unmarshal columns header: %s", bs.bsw.p.path, err)
 		}
 		if partFormatVersion >= 1 {
-			cshIndex := bs.getColumnsHeaderIndex()
+			cshIndex, err := bs.getColumnsHeaderIndex()
+			if err != nil {
+				return nil, err
+			}
 			if err := csh.setColumnNames(cshIndex, bs.bsw.p.columnNames); err != nil {
 				logger.Panicf("FATAL: %s: %s", bs.bsw.p.path, err)
 			}
@@ -385,18 +416,22 @@ func (bs *blockSearch) getColumnsHeader() *columnsHeader {
 
 		bs.cshCache = csh
 	}
-	return bs.cshCache
+	return bs.cshCache, nil
 }
 
-func (bs *blockSearch) getColumnsHeaderBlock() []byte {
+func (bs *blockSearch) getColumnsHeaderBlock() ([]byte, error) {
 	if !bs.cshBlockInitialized {
-		bs.cshBlockCache = readColumnsHeaderBlock(bs.cshBlockCache[:0], bs.bsw.p, &bs.bsw.bh, bs.qs)
+		var err error
+		bs.cshBlockCache, err = readColumnsHeaderBlock(bs.cshBlockCache[:0], bs.bsw.p, &bs.bsw.bh, bs.qs)
+		if err != nil {
+			return nil, err
+		}
 		bs.cshBlockInitialized = true
 	}
-	return bs.cshBlockCache
+	return bs.cshBlockCache, nil
 }
 
-func readColumnsHeaderIndexBlock(dst []byte, p *part, bh *blockHeader, qs *QueryStats) []byte {
+func readColumnsHeaderIndexBlock(dst []byte, p *part, bh *blockHeader, qs *QueryStats) ([]byte, error) {
 	n := bh.columnsHeaderIndexSize
 	if n > maxColumnsHeaderIndexSize {
 		logger.Panicf("FATAL: %s: columns header index size cannot exceed %d bytes; got %d bytes", p.path, maxColumnsHeaderIndexSize, n)
@@ -404,34 +439,38 @@ func readColumnsHeaderIndexBlock(dst []byte, p *part, bh *blockHeader, qs *Query
 
 	dstLen := len(dst)
 	dst = bytesutil.ResizeNoCopyMayOverallocate(dst, int(n)+dstLen)
-	p.columnsHeaderIndexFile.MustReadAt(dst[dstLen:], int64(bh.columnsHeaderIndexOffset))
+	if err := p.columnsHeaderIndexFile.ReadAt(dst[dstLen:], int64(bh.columnsHeaderIndexOffset)); err != nil {
+		return nil, fmt.Errorf("%s: failed to read from column header index file: %w", p.path, err)
+	}
 
 	qs.BytesReadColumnsHeaderIndexes += bh.columnsHeaderIndexSize
 
-	return dst
+	return dst, nil
 }
 
-func readColumnsHeaderBlock(dst []byte, p *part, bh *blockHeader, qs *QueryStats) []byte {
+func readColumnsHeaderBlock(dst []byte, p *part, bh *blockHeader, qs *QueryStats) ([]byte, error) {
 	n := bh.columnsHeaderSize
 	if n > maxColumnsHeaderSize {
 		logger.Panicf("FATAL: %s: columns header size cannot exceed %d bytes; got %d bytes", p.path, maxColumnsHeaderSize, n)
 	}
 	dstLen := len(dst)
 	dst = bytesutil.ResizeNoCopyMayOverallocate(dst, int(n)+dstLen)
-	p.columnsHeaderFile.MustReadAt(dst[dstLen:], int64(bh.columnsHeaderOffset))
+	if err := p.columnsHeaderFile.ReadAt(dst[dstLen:], int64(bh.columnsHeaderOffset)); err != nil {
+		return nil, fmt.Errorf("%s: failed to read from columns header file: %w", p.path, err)
+	}
 
 	qs.BytesReadColumnsHeaders += bh.columnsHeaderSize
 
-	return dst
+	return dst, nil
 }
 
 // getBloomFilterForColumn returns bloom filter for the given ch.
 //
 // The returned bloom filter belongs to bs, so it becomes invalid after bs reset.
-func (bs *blockSearch) getBloomFilterForColumn(ch *columnHeader) *bloomFilter {
+func (bs *blockSearch) getBloomFilterForColumn(ch *columnHeader) (*bloomFilter, error) {
 	bf := bs.bloomFilterCache[ch.name]
 	if bf != nil {
-		return bf
+		return bf, nil
 	}
 
 	p := bs.bsw.p
@@ -443,7 +482,9 @@ func (bs *blockSearch) getBloomFilterForColumn(ch *columnHeader) *bloomFilter {
 		logger.Panicf("FATAL: %s: bloom filter block size cannot exceed %d bytes; got %d bytes", bs.partPath(), maxBloomFilterBlockSize, bloomFilterSize)
 	}
 	bb.B = bytesutil.ResizeNoCopyMayOverallocate(bb.B, int(bloomFilterSize))
-	bloomValuesFile.bloom.MustReadAt(bb.B, int64(ch.bloomFilterOffset))
+	if err := bloomValuesFile.bloom.ReadAt(bb.B, int64(ch.bloomFilterOffset)); err != nil {
+		return nil, fmt.Errorf("%s: failed to read from bloom filter file: %w", bs.partPath(), err)
+	}
 
 	bs.qs.BytesReadBloomFilters += ch.bloomFilterSize
 
@@ -457,16 +498,16 @@ func (bs *blockSearch) getBloomFilterForColumn(ch *columnHeader) *bloomFilter {
 		bs.bloomFilterCache = make(map[string]*bloomFilter)
 	}
 	bs.bloomFilterCache[ch.name] = bf
-	return bf
+	return bf, nil
 }
 
 // getValuesForColumn returns block values for the given ch.
 //
 // The returned values belong to bs, so they become invalid after bs reset.
-func (bs *blockSearch) getValuesForColumn(ch *columnHeader) []string {
+func (bs *blockSearch) getValuesForColumn(ch *columnHeader) ([]string, error) {
 	values := bs.valuesCache[ch.name]
 	if values != nil {
-		return values.a
+		return values.a, nil
 	}
 
 	p := bs.bsw.p
@@ -478,7 +519,9 @@ func (bs *blockSearch) getValuesForColumn(ch *columnHeader) []string {
 		logger.Panicf("FATAL: %s: values block size cannot exceed %d bytes; got %d bytes", bs.partPath(), maxValuesBlockSize, valuesSize)
 	}
 	bb.B = bytesutil.ResizeNoCopyMayOverallocate(bb.B, int(valuesSize))
-	bloomValuesFile.values.MustReadAt(bb.B, int64(ch.valuesOffset))
+	if err := bloomValuesFile.values.ReadAt(bb.B, int64(ch.valuesOffset)); err != nil {
+		return nil, fmt.Errorf("%s: failed to read from bloom values file: %w", bs.partPath(), err)
+	}
 
 	bs.qs.BytesReadValues += ch.valuesSize
 
@@ -497,7 +540,7 @@ func (bs *blockSearch) getValuesForColumn(ch *columnHeader) []string {
 		bs.valuesCache = make(map[string]*stringBucket)
 	}
 	bs.valuesCache[ch.name] = values
-	return values.a
+	return values.a, nil
 }
 
 func getStringsLen(a []string) uint64 {
@@ -524,10 +567,10 @@ func subTimeOffset(timestamps []int64, timeOffset int64) {
 // getTimestamps returns timestamps for the given bs.
 //
 // The returned timestamps belong to bs, so they become invalid after bs reset.
-func (bs *blockSearch) getTimestamps() []int64 {
+func (bs *blockSearch) getTimestamps() ([]int64, error) {
 	timestamps := bs.timestampsCache
 	if timestamps != nil {
-		return timestamps.A
+		return timestamps.A, nil
 	}
 
 	p := bs.bsw.p
@@ -539,7 +582,9 @@ func (bs *blockSearch) getTimestamps() []int64 {
 		logger.Panicf("FATAL: %s: timestamps block size cannot exceed %d bytes; got %d bytes", bs.partPath(), maxTimestampsBlockSize, blockSize)
 	}
 	bb.B = bytesutil.ResizeNoCopyMayOverallocate(bb.B, int(blockSize))
-	p.timestampsFile.MustReadAt(bb.B, int64(th.blockOffset))
+	if err := p.timestampsFile.ReadAt(bb.B, int64(th.blockOffset)); err != nil {
+		return nil, fmt.Errorf("%s: failed to read from timestamps file: %w", bs.partPath(), err)
+	}
 
 	bs.qs.BytesReadTimestamps += blockSize
 	bs.qs.TimestampsRead += bs.bsw.bh.rowsCount
@@ -554,18 +599,20 @@ func (bs *blockSearch) getTimestamps() []int64 {
 	}
 
 	bs.timestampsCache = timestamps
-	return timestamps.A
+	return timestamps.A, nil
 }
 
 // mustReadBlockHeaders reads ih block headers from p, appends them to dst and returns the result.
-func (ih *indexBlockHeader) mustReadBlockHeaders(dst []blockHeader, p *part, qs *QueryStats) []blockHeader {
+func (ih *indexBlockHeader) mustReadBlockHeaders(dst []blockHeader, p *part, qs *QueryStats) ([]blockHeader, error) {
 	bbCompressed := longTermBufPool.Get()
 	indexBlockSize := ih.indexBlockSize
 	if indexBlockSize > maxIndexBlockSize {
 		logger.Panicf("FATAL: %s: index block size cannot exceed %d bytes; got %d bytes", p.indexFile.Path(), maxIndexBlockSize, indexBlockSize)
 	}
 	bbCompressed.B = bytesutil.ResizeNoCopyMayOverallocate(bbCompressed.B, int(indexBlockSize))
-	p.indexFile.MustReadAt(bbCompressed.B, int64(ih.indexBlockOffset))
+	if err := p.indexFile.ReadAt(bbCompressed.B, int64(ih.indexBlockOffset)); err != nil {
+		return nil, fmt.Errorf("%s: failed to read from index file: %s", p.indexFile.Path(), err)
+	}
 
 	qs.BytesReadBlockHeaders += ih.indexBlockSize
 
@@ -583,7 +630,7 @@ func (ih *indexBlockHeader) mustReadBlockHeaders(dst []blockHeader, p *part, qs 
 		logger.Panicf("FATAL: %s: cannot unmarshal block headers read at offset %d with size %d: %s", p.indexFile.Path(), ih.indexBlockOffset, ih.indexBlockSize, err)
 	}
 
-	return dst
+	return dst, nil
 }
 
 // getStreamStr returns _stream value for the given block at bs.

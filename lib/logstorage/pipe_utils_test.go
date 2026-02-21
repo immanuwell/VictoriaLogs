@@ -53,7 +53,7 @@ func expectPipeResults(t *testing.T, pipeStr string, rows, rowsExpected [][]Fiel
 
 	workersCount := 5
 	stopCh := make(chan struct{})
-	cancel := func() {}
+	cancel := func(_ error) {}
 	ppTest := newTestPipeProcessor()
 	pp := p.newPipeProcessor(workersCount, stopCh, cancel, ppTest)
 
@@ -144,7 +144,10 @@ func (pp *testPipeProcessor) writeBlock(_ uint, br *blockResult) {
 	cs := br.getColumns()
 	var columnValues [][]string
 	for _, c := range cs {
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return
+		}
 		columnValues = append(columnValues, values)
 	}
 
@@ -161,9 +164,7 @@ func (pp *testPipeProcessor) writeBlock(_ uint, br *blockResult) {
 	}
 }
 
-func (pp *testPipeProcessor) flush() error {
-	return nil
-}
+func (pp *testPipeProcessor) flush() {}
 
 func (pp *testPipeProcessor) expectRows(t *testing.T, expectedRows [][]Field) {
 	t.Helper()

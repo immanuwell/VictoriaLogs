@@ -81,12 +81,13 @@ func (uctx *fieldsUnpackerContext) addField(name, value string) {
 	})
 }
 
-func newPipeUnpackProcessor(unpackFunc func(uctx *fieldsUnpackerContext, s string), ppNext pipeProcessor,
+func newPipeUnpackProcessor(unpackFunc func(uctx *fieldsUnpackerContext, s string), ppNext pipeProcessor, cancel func(error),
 	fromField string, fieldPrefix string, keepOriginalFields, skipEmptyResults bool, iff *ifFilter) *pipeUnpackProcessor {
 
 	return &pipeUnpackProcessor{
 		unpackFunc: unpackFunc,
 		ppNext:     ppNext,
+		cancel:     cancel,
 
 		fromField:          fromField,
 		fieldPrefix:        fieldPrefix,
@@ -101,6 +102,7 @@ type pipeUnpackProcessor struct {
 	ppNext     pipeProcessor
 
 	shards atomicutil.Slice[pipeUnpackProcessorShard]
+	cancel func(error)
 
 	fromField          string
 	fieldPrefix        string
@@ -126,11 +128,20 @@ func (pup *pipeUnpackProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.wctx.init(workerID, pup.ppNext, pup.keepOriginalFields, pup.skipEmptyResults, br)
 	shard.uctx.init(pup.fieldPrefix)
 
+	defer func() {
+		shard.wctx.flush()
+		shard.wctx.reset()
+		shard.uctx.reset()
+	}()
+
 	bm := &shard.bm
 	if pup.iff != nil {
 		bm.init(br.rowsLen)
 		bm.setBits()
-		pup.iff.f.applyToBlockResult(br, bm)
+		if err := pup.iff.f.applyToBlockResult(br, bm); err != nil {
+			pup.cancel(err)
+			return
+		}
 		if bm.isZero() {
 			pup.ppNext.writeBlock(workerID, br)
 			return
@@ -143,17 +154,27 @@ func (pup *pipeUnpackProcessor) writeBlock(workerID uint, br *blockResult) {
 		shard.uctx.resetFields()
 		pup.unpackFunc(&shard.uctx, v)
 		for rowIdx := range br.rowsLen {
+			var err error
 			if pup.iff == nil || bm.isSetBit(rowIdx) {
-				shard.wctx.writeRow(rowIdx, shard.uctx.fields)
+				err = shard.wctx.writeRow(rowIdx, shard.uctx.fields)
 			} else {
-				shard.wctx.writeRow(rowIdx, nil)
+				err = shard.wctx.writeRow(rowIdx, nil)
+			}
+			if err != nil {
+				pup.cancel(err)
+				return
 			}
 		}
 	} else {
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			pup.cancel(err)
+			return
+		}
 		vPrev := ""
 		hadUnpacks := false
 		for rowIdx, v := range values {
+			var err error
 			if pup.iff == nil || bm.isSetBit(rowIdx) {
 				if !hadUnpacks || vPrev != v {
 					vPrev = v
@@ -162,21 +183,19 @@ func (pup *pipeUnpackProcessor) writeBlock(workerID uint, br *blockResult) {
 					shard.uctx.resetFields()
 					pup.unpackFunc(&shard.uctx, v)
 				}
-				shard.wctx.writeRow(rowIdx, shard.uctx.fields)
+				err = shard.wctx.writeRow(rowIdx, shard.uctx.fields)
 			} else {
-				shard.wctx.writeRow(rowIdx, nil)
+				err = shard.wctx.writeRow(rowIdx, nil)
+			}
+			if err != nil {
+				pup.cancel(err)
+				return
 			}
 		}
 	}
-
-	shard.wctx.flush()
-	shard.wctx.reset()
-	shard.uctx.reset()
 }
 
-func (pup *pipeUnpackProcessor) flush() error {
-	return nil
-}
+func (pup *pipeUnpackProcessor) flush() {}
 
 type pipeUnpackWriteContext struct {
 	workerID           uint
@@ -228,7 +247,7 @@ func (wctx *pipeUnpackWriteContext) init(workerID uint, ppNext pipeProcessor, ke
 	wctx.csSrc = brSrc.getColumns()
 }
 
-func (wctx *pipeUnpackWriteContext) writeRow(rowIdx int, extraFields []Field) {
+func (wctx *pipeUnpackWriteContext) writeRow(rowIdx int, extraFields []Field) error {
 	csSrc := wctx.csSrc
 	rcs := wctx.rcs
 
@@ -257,7 +276,10 @@ func (wctx *pipeUnpackWriteContext) writeRow(rowIdx int, extraFields []Field) {
 
 	brSrc := wctx.brSrc
 	for i, c := range csSrc {
-		v := c.getValueAtRow(brSrc, rowIdx)
+		v, err := c.getValueAtRow(brSrc, rowIdx)
+		if err != nil {
+			return err
+		}
 		rcs[i].addValue(v)
 		wctx.valuesLen += len(v)
 	}
@@ -266,7 +288,10 @@ func (wctx *pipeUnpackWriteContext) writeRow(rowIdx int, extraFields []Field) {
 		if v == "" && wctx.skipEmptyResults || wctx.keepOriginalFields {
 			idx := getBlockResultColumnIdxByName(csSrc, f.Name)
 			if idx >= 0 {
-				vOrig := csSrc[idx].getValueAtRow(brSrc, rowIdx)
+				vOrig, err := csSrc[idx].getValueAtRow(brSrc, rowIdx)
+				if err != nil {
+					return err
+				}
 				if vOrig != "" {
 					v = vOrig
 				}
@@ -281,6 +306,7 @@ func (wctx *pipeUnpackWriteContext) writeRow(rowIdx int, extraFields []Field) {
 	if wctx.valuesLen >= 64_000 {
 		wctx.flush()
 	}
+	return nil
 }
 
 func (wctx *pipeUnpackWriteContext) flush() {

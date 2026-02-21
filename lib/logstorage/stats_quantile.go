@@ -42,37 +42,44 @@ type statsQuantileProcessor struct {
 	h histogram
 }
 
-func (sqp *statsQuantileProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (sqp *statsQuantileProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sq := sf.(*statsQuantile)
 
 	stateSizeIncrease := 0
 
 	mc := getMatchingColumns(br, sq.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		stateSizeIncrease += sqp.updateStateForColumn(br, c)
+		state, err := sqp.updateStateForColumn(br, c)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
 	}
-	putMatchingColumns(mc)
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (sqp *statsQuantileProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (sqp *statsQuantileProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sq := sf.(*statsQuantile)
 
 	h := &sqp.h
 	stateSizeIncrease := 0
 
 	mc := getMatchingColumns(br, sq.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
 		stateSizeIncrease += h.update(v)
 	}
-	putMatchingColumns(mc)
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (sqp *statsQuantileProcessor) updateStateForColumn(br *blockResult, c *blockResultColumn) int {
+func (sqp *statsQuantileProcessor) updateStateForColumn(br *blockResult, c *blockResultColumn) (int, error) {
 	h := &sqp.h
 	stateSizeIncrease := 0
 
@@ -81,100 +88,143 @@ func (sqp *statsQuantileProcessor) updateStateForColumn(br *blockResult, c *bloc
 		for range br.rowsLen {
 			stateSizeIncrease += h.update(v)
 		}
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	}
 	if c.isTime {
-		timestamps := br.getTimestamps()
+		timestamps, err := br.getTimestamps()
+		if err != nil {
+			return 0, err
+		}
 		bb := bbPool.Get()
 		for _, ts := range timestamps {
 			bb.B = marshalTimestampRFC3339NanoString(bb.B[:0], ts)
 			stateSizeIncrease += h.update(bytesutil.ToUnsafeString(bb.B))
 		}
 		bbPool.Put(bb)
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		for _, v := range c.getValues(br) {
+		values, err := c.getValues(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range values {
 			stateSizeIncrease += h.update(v)
 		}
 	case valueTypeDict:
 		dictValues := c.dictValues
-		for _, ve := range c.getValuesEncoded(br) {
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, ve := range valuesEncoded {
 			idx := ve[0]
 			v := dictValues[idx]
 			stateSizeIncrease += h.update(v)
 		}
 	case valueTypeUint8:
 		bb := bbPool.Get()
-		for _, v := range c.getValuesEncoded(br) {
+		defer bbPool.Put(bb)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range valuesEncoded {
 			n := unmarshalUint8(v)
 			bb.B = marshalUint8String(bb.B[:0], n)
 			stateSizeIncrease += h.update(bytesutil.ToUnsafeString(bb.B))
 		}
-		bbPool.Put(bb)
 	case valueTypeUint16:
 		bb := bbPool.Get()
-		for _, v := range c.getValuesEncoded(br) {
+		defer bbPool.Put(bb)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range valuesEncoded {
 			n := unmarshalUint16(v)
 			bb.B = marshalUint16String(bb.B[:0], n)
 			stateSizeIncrease += h.update(bytesutil.ToUnsafeString(bb.B))
 		}
-		bbPool.Put(bb)
 	case valueTypeUint32:
 		bb := bbPool.Get()
-		for _, v := range c.getValuesEncoded(br) {
+		defer bbPool.Put(bb)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range valuesEncoded {
 			n := unmarshalUint32(v)
 			bb.B = marshalUint32String(bb.B[:0], n)
 			stateSizeIncrease += h.update(bytesutil.ToUnsafeString(bb.B))
 		}
-		bbPool.Put(bb)
 	case valueTypeUint64:
 		bb := bbPool.Get()
-		for _, v := range c.getValuesEncoded(br) {
+		defer bbPool.Put(bb)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range valuesEncoded {
 			n := unmarshalUint64(v)
 			bb.B = marshalUint64String(bb.B[:0], n)
 			stateSizeIncrease += h.update(bytesutil.ToUnsafeString(bb.B))
 		}
-		bbPool.Put(bb)
 	case valueTypeInt64:
 		bb := bbPool.Get()
-		for _, v := range c.getValuesEncoded(br) {
+		defer bbPool.Put(bb)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range valuesEncoded {
 			n := unmarshalInt64(v)
 			bb.B = marshalInt64String(bb.B[:0], n)
 			stateSizeIncrease += h.update(bytesutil.ToUnsafeString(bb.B))
 		}
-		bbPool.Put(bb)
 	case valueTypeFloat64:
 		bb := bbPool.Get()
-		for _, v := range c.getValuesEncoded(br) {
+		defer bbPool.Put(bb)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range valuesEncoded {
 			f := unmarshalFloat64(v)
 			bb.B = marshalFloat64String(bb.B[:0], f)
 			stateSizeIncrease += h.update(bytesutil.ToUnsafeString(bb.B))
 		}
-		bbPool.Put(bb)
 	case valueTypeIPv4:
 		bb := bbPool.Get()
-		for _, v := range c.getValuesEncoded(br) {
+		defer bbPool.Put(bb)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range valuesEncoded {
 			n := unmarshalIPv4(v)
 			bb.B = marshalIPv4String(bb.B[:0], n)
 			stateSizeIncrease += h.update(bytesutil.ToUnsafeString(bb.B))
 		}
-		bbPool.Put(bb)
 	case valueTypeTimestampISO8601:
 		bb := bbPool.Get()
-		for _, v := range c.getValuesEncoded(br) {
+		defer bbPool.Put(bb)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range valuesEncoded {
 			n := unmarshalTimestampISO8601(v)
 			bb.B = marshalTimestampISO8601String(bb.B[:0], n)
 			stateSizeIncrease += h.update(bytesutil.ToUnsafeString(bb.B))
 		}
-		bbPool.Put(bb)
 	default:
 		logger.Panicf("BUG: unexpected valueType=%d", c.valueType)
 	}
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
 func (sqp *statsQuantileProcessor) mergeState(_ *chunkedAllocator, _ statsFunc, sfp statsProcessor) {

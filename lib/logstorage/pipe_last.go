@@ -74,7 +74,7 @@ func (pl *pipeLast) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pl *pipeLast) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (pl *pipeLast) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return newPipeTopkProcessor(pl.ps, stopCh, cancel, ppNext)
 }
 

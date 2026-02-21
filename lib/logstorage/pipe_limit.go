@@ -50,10 +50,10 @@ func (pl *pipeLimit) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pl *pipeLimit) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (pl *pipeLimit) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	if pl.limit == 0 {
 		// Special case - notify the caller to stop writing data to the returned pipeLimitProcessor
-		cancel()
+		cancel(nil)
 	}
 	return &pipeLimitProcessor{
 		pl:     pl,
@@ -64,7 +64,7 @@ func (pl *pipeLimit) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(), p
 
 type pipeLimitProcessor struct {
 	pl     *pipeLimit
-	cancel func()
+	cancel func(error)
 	ppNext pipeProcessor
 
 	rowsProcessed atomic.Uint64
@@ -81,7 +81,7 @@ func (plp *pipeLimitProcessor) writeBlock(workerID uint, br *blockResult) {
 		// Fast path - write all the rows to ppNext.
 		plp.ppNext.writeBlock(workerID, br)
 		if rowsProcessed == limit {
-			plp.cancel()
+			plp.cancel(nil)
 		}
 		return
 	}
@@ -95,16 +95,17 @@ func (plp *pipeLimitProcessor) writeBlock(workerID uint, br *blockResult) {
 
 	// Write remaining rows.
 	keepRows := limit - rowsProcessed
-	br.truncateRows(int(keepRows))
+	if err := br.truncateRows(int(keepRows)); err != nil {
+		plp.cancel(err)
+		return
+	}
 	plp.ppNext.writeBlock(workerID, br)
 
 	// Notify the caller that it should stop passing more data to writeBlock().
-	plp.cancel()
+	plp.cancel(nil)
 }
 
-func (plp *pipeLimitProcessor) flush() error {
-	return nil
-}
+func (plp *pipeLimitProcessor) flush() {}
 
 func parsePipeLimit(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("limit", "head") {

@@ -20,12 +20,13 @@ func updateNeededFieldsForPipePack(pf *prefixfilter.Filter, resultField string, 
 	}
 }
 
-func newPipePackProcessor(ppNext pipeProcessor, resultField string, fields []string, marshalFields func(dst []byte, fields []Field) []byte) pipeProcessor {
+func newPipePackProcessor(ppNext pipeProcessor, cancel func(error), resultField string, fields []string, marshalFields func(dst []byte, fields []Field) []byte) pipeProcessor {
 	return &pipePackProcessor{
 		ppNext:        ppNext,
 		resultField:   resultField,
 		fields:        fields,
 		marshalFields: marshalFields,
+		cancel:        cancel,
 	}
 }
 
@@ -36,6 +37,7 @@ type pipePackProcessor struct {
 	marshalFields func(dst []byte, fields []Field) []byte
 
 	shards atomicutil.Slice[pipePackProcessorShard]
+	cancel func(error)
 }
 
 type pipePackProcessorShard struct {
@@ -76,7 +78,11 @@ func (ppp *pipePackProcessor) writeBlock(workerID uint, br *blockResult) {
 	for rowIdx := range br.rowsLen {
 		fields = fields[:0]
 		for _, c := range cs {
-			v := c.getValueAtRow(br, rowIdx)
+			v, err := c.getValueAtRow(br, rowIdx)
+			if err != nil {
+				ppp.cancel(err)
+				return
+			}
 			fields = append(fields, Field{
 				Name:  c.name,
 				Value: v,
@@ -92,10 +98,7 @@ func (ppp *pipePackProcessor) writeBlock(workerID uint, br *blockResult) {
 
 	br.addResultColumn(shard.rc)
 	ppp.ppNext.writeBlock(workerID, br)
-
 	shard.rc.reset()
 }
 
-func (ppp *pipePackProcessor) flush() error {
-	return nil
-}
+func (ppp *pipePackProcessor) flush() {}

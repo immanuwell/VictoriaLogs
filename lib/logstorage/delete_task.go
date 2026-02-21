@@ -28,7 +28,7 @@ type DeleteTask struct {
 	ctx context.Context
 
 	// cancel is set to non-nil during task execution. It is used for canceling the delete task.
-	cancel func()
+	cancel func(error)
 
 	// doneCh is used for waiting until the delete task is complete.
 	doneCh chan struct{}

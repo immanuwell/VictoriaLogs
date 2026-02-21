@@ -56,7 +56,7 @@ func (pd *pipeDelete) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pd *pipeDelete) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pd *pipeDelete) newPipeProcessor(_ int, _ <-chan struct{}, _ func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeDeleteProcessor{
 		pd:     pd,
 		ppNext: ppNext,
@@ -77,9 +77,7 @@ func (pdp *pipeDeleteProcessor) writeBlock(workerID uint, br *blockResult) {
 	pdp.ppNext.writeBlock(workerID, br)
 }
 
-func (pdp *pipeDeleteProcessor) flush() error {
-	return nil
-}
+func (pdp *pipeDeleteProcessor) flush() {}
 
 func parsePipeDelete(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("delete", "del", "rm", "drop") {

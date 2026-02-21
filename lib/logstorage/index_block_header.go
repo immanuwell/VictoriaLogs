@@ -120,11 +120,11 @@ func mustWriteIndexBlockHeaders(w *writerWithStats, metaindexData []byte) {
 	}
 }
 
-// mustReadIndexBlockHeaders reads indexBlockHeader entries from r, appends them to dst and returns the result.
-func mustReadIndexBlockHeaders(dst []indexBlockHeader, r *readerWithStats) []indexBlockHeader {
+// readIndexBlockHeaders reads indexBlockHeader entries from r, appends them to dst and returns the result.
+func readIndexBlockHeaders(dst []indexBlockHeader, r *readerWithStats) ([]indexBlockHeader, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
-		logger.Panicf("FATAL: %s: cannot read indexBlockHeader entries: %s", r.Path(), err)
+		return nil, fmt.Errorf("%s: cannot read indexBlockHeader entries: %w", r.Path(), err)
 	}
 
 	bb := longTermBufPool.Get()
@@ -140,7 +140,7 @@ func mustReadIndexBlockHeaders(dst []indexBlockHeader, r *readerWithStats) []ind
 		logger.Panicf("FATAL: %s: cannot parse indexBlockHeader entries: %s", r.Path(), err)
 	}
 
-	return dst
+	return dst, nil
 }
 
 // unmarshalIndexBlockHeaders appends unmarshaled from src indexBlockHeader entries to dst and returns the result.

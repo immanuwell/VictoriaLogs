@@ -28,12 +28,16 @@ type statsJSONValuesSortedEntry struct {
 	sortValues []string
 }
 
-func newStatsJSONValuesSortedEntry(br *blockResult, cs []*blockResultColumn, sortValues []string, rowIdx int) *statsJSONValuesSortedEntry {
+func newStatsJSONValuesSortedEntry(br *blockResult, cs []*blockResultColumn, sortValues []string, rowIdx int) (*statsJSONValuesSortedEntry, error) {
 	fields := make([]Field, len(cs))
 	for i, c := range cs {
+		values, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return nil, err
+		}
 		fields[i] = Field{
 			Name:  c.name,
-			Value: c.getValueAtRow(br, rowIdx),
+			Value: values,
 		}
 	}
 	value := string(MarshalFieldsToJSON(nil, fields))
@@ -46,62 +50,80 @@ func newStatsJSONValuesSortedEntry(br *blockResult, cs []*blockResultColumn, sor
 	return &statsJSONValuesSortedEntry{
 		value:      value,
 		sortValues: sortValuesCopy,
-	}
+	}, nil
 }
 
 func (e *statsJSONValuesSortedEntry) sizeBytes() int {
 	return int(unsafe.Sizeof(*e)) + len(e.value) + int(unsafe.Sizeof(e.sortValues))*cap(e.sortValues)
 }
 
-func (svp *statsJSONValuesSortedProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (svp *statsJSONValuesSortedProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sv := sf.(*statsJSONValues)
 
-	svp.initSortColumns(br, sv.sortFields)
+	if err := svp.initSortColumns(br, sv.sortFields); err != nil {
+		return 0, err
+	}
 
 	stateSizeIncrease := 0
 	mc := getMatchingColumns(br, sv.fieldFilters)
+	defer putMatchingColumns(mc)
 	mc.sort()
 	for rowIdx := range br.rowsLen {
-		stateSizeIncrease += svp.updateStateForRow(br, mc.cs, rowIdx)
+		state, err := svp.updateStateForRow(br, mc.cs, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
 	}
-	putMatchingColumns(mc)
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (svp *statsJSONValuesSortedProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (svp *statsJSONValuesSortedProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sv := sf.(*statsJSONValues)
 
-	svp.initSortColumns(br, sv.sortFields)
+	if err := svp.initSortColumns(br, sv.sortFields); err != nil {
+		return 0, err
+	}
 
 	mc := getMatchingColumns(br, sv.fieldFilters)
+	defer putMatchingColumns(mc)
 	mc.sort()
-	stateSizeIncrease := svp.updateStateForRow(br, mc.cs, rowIdx)
-	putMatchingColumns(mc)
+	stateSizeIncrease, err := svp.updateStateForRow(br, mc.cs, rowIdx)
+	if err != nil {
+		return 0, err
+	}
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (svp *statsJSONValuesSortedProcessor) updateStateForRow(br *blockResult, cs []*blockResultColumn, rowIdx int) int {
+func (svp *statsJSONValuesSortedProcessor) updateStateForRow(br *blockResult, cs []*blockResultColumn, rowIdx int) (int, error) {
 	svp.sortValuesBuf = slicesutil.SetLength(svp.sortValuesBuf, len(svp.sortColumns))
 	for i, values := range svp.sortColumns {
 		svp.sortValuesBuf[i] = values[rowIdx]
 	}
 
-	e := newStatsJSONValuesSortedEntry(br, cs, svp.sortValuesBuf, rowIdx)
+	e, err := newStatsJSONValuesSortedEntry(br, cs, svp.sortValuesBuf, rowIdx)
+	if err != nil {
+		return 0, err
+	}
 
 	svp.entries = append(svp.entries, e)
 
-	return e.sizeBytes() + int(unsafe.Sizeof(svp.entries[0]))
+	return e.sizeBytes() + int(unsafe.Sizeof(svp.entries[0])), nil
 }
 
-func (svp *statsJSONValuesSortedProcessor) initSortColumns(br *blockResult, sortFields []*bySortField) {
+func (svp *statsJSONValuesSortedProcessor) initSortColumns(br *blockResult, sortFields []*bySortField) error {
 	svp.sortColumns = svp.sortColumns[:0]
 	for _, sf := range sortFields {
 		c := br.getColumnByName(sf.name)
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return err
+		}
 		svp.sortColumns = append(svp.sortColumns, values)
 	}
+	return nil
 }
 
 func (svp *statsJSONValuesSortedProcessor) mergeState(_ *chunkedAllocator, _ statsFunc, sfp statsProcessor) {

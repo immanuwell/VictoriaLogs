@@ -38,116 +38,118 @@ func (fr *filterStringRange) matchRowByField(fields []Field, fieldName string) b
 	return matchStringRange(v, fr.minValue, fr.maxValue)
 }
 
-func (fr *filterStringRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fr *filterStringRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	minValue := fr.minValue
 	maxValue := fr.maxValue
 
 	if minValue > maxValue {
 		bm.resetBits()
-		return
+		return nil
 	}
 
-	applyToBlockResultGeneric(br, bm, fieldName, "", func(v, _ string) bool {
+	return applyToBlockResultGeneric(br, bm, fieldName, "", func(v, _ string) bool {
 		return matchStringRange(v, minValue, maxValue)
 	})
 }
 
-func (fr *filterStringRange) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fr *filterStringRange) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	minValue := fr.minValue
 	maxValue := fr.maxValue
 
 	if minValue > maxValue {
 		bm.resetBits()
-		return
+		return nil
 	}
 
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if !matchStringRange(v, minValue, maxValue) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether filter matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		if !matchStringRange("", minValue, maxValue) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	switch ch.valueType {
 	case valueTypeString:
-		matchStringByStringRange(bs, ch, bm, minValue, maxValue)
+		return matchStringByStringRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeDict:
-		matchValuesDictByStringRange(bs, ch, bm, minValue, maxValue)
+		return matchValuesDictByStringRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeUint8:
-		matchUint8ByStringRange(bs, ch, bm, minValue, maxValue)
+		return matchUint8ByStringRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeUint16:
-		matchUint16ByStringRange(bs, ch, bm, minValue, maxValue)
+		return matchUint16ByStringRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeUint32:
-		matchUint32ByStringRange(bs, ch, bm, minValue, maxValue)
+		return matchUint32ByStringRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeUint64:
-		matchUint64ByStringRange(bs, ch, bm, minValue, maxValue)
+		return matchUint64ByStringRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeInt64:
-		matchInt64ByStringRange(bs, ch, bm, minValue, maxValue)
+		return matchInt64ByStringRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeFloat64:
-		matchFloat64ByStringRange(bs, ch, bm, minValue, maxValue)
+		return matchFloat64ByStringRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeIPv4:
-		matchIPv4ByStringRange(bs, ch, bm, minValue, maxValue)
+		return matchIPv4ByStringRange(bs, ch, bm, minValue, maxValue)
 	case valueTypeTimestampISO8601:
-		matchTimestampISO8601ByStringRange(bs, ch, bm, minValue, maxValue)
+		return matchTimestampISO8601ByStringRange(bs, ch, bm, minValue, maxValue)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
-func matchTimestampISO8601ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) {
+func matchTimestampISO8601ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) error {
 	if minValue > "9" || maxValue < "0" {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toTimestampISO8601String(bs, bb, v)
 		return matchStringRange(s, minValue, maxValue)
 	})
-	bbPool.Put(bb)
 }
 
-func matchIPv4ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) {
+func matchIPv4ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) error {
 	if minValue > "9" || maxValue < "0" {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toIPv4String(bs, bb, v)
 		return matchStringRange(s, minValue, maxValue)
 	})
-	bbPool.Put(bb)
 }
 
-func matchFloat64ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) {
+func matchFloat64ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) error {
 	if minValue > "9" || maxValue < "+" {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toFloat64String(bs, bb, v)
 		return matchStringRange(s, minValue, maxValue)
 	})
-	bbPool.Put(bb)
 }
 
-func matchValuesDictByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) {
+func matchValuesDictByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) error {
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 	for _, v := range ch.valuesDict.values {
 		c := byte(0)
 		if matchStringRange(v, minValue, maxValue) {
@@ -155,79 +157,78 @@ func matchValuesDictByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap,
 		}
 		bb.B = append(bb.B, c)
 	}
-	matchEncodedValuesDict(bs, ch, bm, bb.B)
-	bbPool.Put(bb)
+	return matchEncodedValuesDict(bs, ch, bm, bb.B)
 }
 
-func matchStringByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) {
-	visitValues(bs, ch, bm, func(v string) bool {
+func matchStringByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) error {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		return matchStringRange(v, minValue, maxValue)
 	})
 }
 
-func matchUint8ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) {
+func matchUint8ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) error {
 	if minValue > "9" || maxValue < "0" {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint8String(bs, bb, v)
 		return matchStringRange(s, minValue, maxValue)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint16ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) {
+func matchUint16ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) error {
 	if minValue > "9" || maxValue < "0" {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint16String(bs, bb, v)
 		return matchStringRange(s, minValue, maxValue)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint32ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) {
+func matchUint32ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) error {
 	if minValue > "9" || maxValue < "0" {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint32String(bs, bb, v)
 		return matchStringRange(s, minValue, maxValue)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint64ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) {
+func matchUint64ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) error {
 	if minValue > "9" || maxValue < "0" {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint64String(bs, bb, v)
 		return matchStringRange(s, minValue, maxValue)
 	})
-	bbPool.Put(bb)
 }
 
-func matchInt64ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) {
+func matchInt64ByStringRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue string) error {
 	if minValue != "-" && minValue > "9" || maxValue != "-" && maxValue < "0" {
 		bm.resetBits()
-		return
+		return nil
 	}
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toInt64String(bs, bb, v)
 		return matchStringRange(s, minValue, maxValue)
 	})
-	bbPool.Put(bb)
 }
 
 func matchStringRange(s, minValue, maxValue string) bool {

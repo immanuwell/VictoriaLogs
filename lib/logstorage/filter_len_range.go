@@ -35,13 +35,13 @@ func (fr *filterLenRange) matchRowByField(fields []Field, fieldName string) bool
 	return matchLenRange(v, fr.minLen, fr.maxLen)
 }
 
-func (fr *filterLenRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fr *filterLenRange) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	minLen := fr.minLen
 	maxLen := fr.maxLen
 
 	if minLen > maxLen {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	c := br.getColumnByName(fieldName)
@@ -50,17 +50,20 @@ func (fr *filterLenRange) applyToBlockResultByField(br *blockResult, bm *bitmap,
 		if !matchLenRange(v, minLen, maxLen) {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 	if c.isTime {
-		matchColumnByLenRange(br, bm, c, minLen, maxLen)
+		if err := matchColumnByLenRange(br, bm, c, minLen, maxLen); err != nil {
+			return err
+		}
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		matchColumnByLenRange(br, bm, c, minLen, maxLen)
+		return matchColumnByLenRange(br, bm, c, minLen, maxLen)
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range c.dictValues {
 			c := byte(0)
 			if matchLenRange(v, minLen, maxLen) {
@@ -68,120 +71,128 @@ func (fr *filterLenRange) applyToBlockResultByField(br *blockResult, bm *bitmap,
 			}
 			bb.B = append(bb.B, c)
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			n := valuesEncoded[idx][0]
 			return bb.B[n] == 1
 		})
-		bbPool.Put(bb)
 	case valueTypeUint8:
 		if minLen > 3 || maxLen == 0 {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByLenRange(br, bm, c, minLen, maxLen)
+		return matchColumnByLenRange(br, bm, c, minLen, maxLen)
 	case valueTypeUint16:
 		if minLen > 5 || maxLen == 0 {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByLenRange(br, bm, c, minLen, maxLen)
+		return matchColumnByLenRange(br, bm, c, minLen, maxLen)
 	case valueTypeUint32:
 		if minLen > 10 || maxLen == 0 {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByLenRange(br, bm, c, minLen, maxLen)
+		return matchColumnByLenRange(br, bm, c, minLen, maxLen)
 	case valueTypeUint64:
 		if minLen > 20 || maxLen == 0 {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByLenRange(br, bm, c, minLen, maxLen)
+		return matchColumnByLenRange(br, bm, c, minLen, maxLen)
 	case valueTypeInt64:
 		if minLen > 21 || maxLen == 0 {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByLenRange(br, bm, c, minLen, maxLen)
+		return matchColumnByLenRange(br, bm, c, minLen, maxLen)
 	case valueTypeFloat64:
 		if minLen > 24 || maxLen == 0 {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByLenRange(br, bm, c, minLen, maxLen)
+		return matchColumnByLenRange(br, bm, c, minLen, maxLen)
 	case valueTypeIPv4:
 		if minLen > uint64(len("255.255.255.255")) || maxLen < uint64(len("0.0.0.0")) {
 			bm.resetBits()
-			return
+			return nil
 		}
-		matchColumnByLenRange(br, bm, c, minLen, maxLen)
+		return matchColumnByLenRange(br, bm, c, minLen, maxLen)
 	case valueTypeTimestampISO8601:
 		matchTimestampISO8601ByLenRange(bm, minLen, maxLen)
 	default:
 		logger.Panicf("FATAL: unknown valueType=%d", c.valueType)
 	}
+	return nil
 }
 
-func matchColumnByLenRange(br *blockResult, bm *bitmap, c *blockResultColumn, minLen, maxLen uint64) {
-	values := c.getValues(br)
+func matchColumnByLenRange(br *blockResult, bm *bitmap, c *blockResultColumn, minLen, maxLen uint64) error {
+	values, err := c.getValues(br)
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		v := values[idx]
 		return matchLenRange(v, minLen, maxLen)
 	})
+	return nil
 }
 
-func (fr *filterLenRange) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fr *filterLenRange) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	minLen := fr.minLen
 	maxLen := fr.maxLen
 
 	if minLen > maxLen {
 		bm.resetBits()
-		return
+		return nil
 	}
 
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if !matchLenRange(v, minLen, maxLen) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether filter matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		// Fast path - there are no matching columns.
 		if !matchLenRange("", minLen, maxLen) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	switch ch.valueType {
 	case valueTypeString:
-		matchStringByLenRange(bs, ch, bm, minLen, maxLen)
+		return matchStringByLenRange(bs, ch, bm, minLen, maxLen)
 	case valueTypeDict:
-		matchValuesDictByLenRange(bs, ch, bm, minLen, maxLen)
+		return matchValuesDictByLenRange(bs, ch, bm, minLen, maxLen)
 	case valueTypeUint8:
-		matchUint8ByLenRange(bs, ch, bm, minLen, maxLen)
+		return matchUint8ByLenRange(bs, ch, bm, minLen, maxLen)
 	case valueTypeUint16:
-		matchUint16ByLenRange(bs, ch, bm, minLen, maxLen)
+		return matchUint16ByLenRange(bs, ch, bm, minLen, maxLen)
 	case valueTypeUint32:
-		matchUint32ByLenRange(bs, ch, bm, minLen, maxLen)
+		return matchUint32ByLenRange(bs, ch, bm, minLen, maxLen)
 	case valueTypeUint64:
-		matchUint64ByLenRange(bs, ch, bm, minLen, maxLen)
+		return matchUint64ByLenRange(bs, ch, bm, minLen, maxLen)
 	case valueTypeInt64:
-		matchInt64ByLenRange(bs, ch, bm, minLen, maxLen)
+		return matchInt64ByLenRange(bs, ch, bm, minLen, maxLen)
 	case valueTypeFloat64:
-		matchFloat64ByLenRange(bs, ch, bm, minLen, maxLen)
+		return matchFloat64ByLenRange(bs, ch, bm, minLen, maxLen)
 	case valueTypeIPv4:
-		matchIPv4ByLenRange(bs, ch, bm, minLen, maxLen)
+		return matchIPv4ByLenRange(bs, ch, bm, minLen, maxLen)
 	case valueTypeTimestampISO8601:
 		matchTimestampISO8601ByLenRange(bm, minLen, maxLen)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
 func matchTimestampISO8601ByLenRange(bm *bitmap, minLen, maxLen uint64) {
@@ -191,36 +202,37 @@ func matchTimestampISO8601ByLenRange(bm *bitmap, minLen, maxLen uint64) {
 	}
 }
 
-func matchIPv4ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) {
+func matchIPv4ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) error {
 	if minLen > uint64(len("255.255.255.255")) || maxLen < uint64(len("0.0.0.0")) {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toIPv4String(bs, bb, v)
 		return matchLenRange(s, minLen, maxLen)
 	})
-	bbPool.Put(bb)
 }
 
-func matchFloat64ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) {
+func matchFloat64ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) error {
 	if minLen > 24 || maxLen == 0 {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toFloat64String(bs, bb, v)
 		return matchLenRange(s, minLen, maxLen)
 	})
-	bbPool.Put(bb)
 }
 
-func matchValuesDictByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) {
+func matchValuesDictByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) error {
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 	for _, v := range ch.valuesDict.values {
 		c := byte(0)
 		if matchLenRange(v, minLen, maxLen) {
@@ -228,95 +240,95 @@ func matchValuesDictByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, mi
 		}
 		bb.B = append(bb.B, c)
 	}
-	matchEncodedValuesDict(bs, ch, bm, bb.B)
-	bbPool.Put(bb)
+	return matchEncodedValuesDict(bs, ch, bm, bb.B)
 }
 
-func matchStringByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) {
-	visitValues(bs, ch, bm, func(v string) bool {
+func matchStringByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) error {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		return matchLenRange(v, minLen, maxLen)
 	})
 }
 
-func matchUint8ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) {
+func matchUint8ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) error {
 	if minLen > 3 || maxLen == 0 {
 		bm.resetBits()
-		return
+		return nil
 	}
 	if !matchMinMaxValueLen(ch, minLen, maxLen) {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint8String(bs, bb, v)
 		return matchLenRange(s, minLen, maxLen)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint16ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) {
+func matchUint16ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) error {
 	if minLen > 5 || maxLen == 0 {
 		bm.resetBits()
-		return
+		return nil
 	}
 	if !matchMinMaxValueLen(ch, minLen, maxLen) {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint16String(bs, bb, v)
 		return matchLenRange(s, minLen, maxLen)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint32ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) {
+func matchUint32ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) error {
 	if minLen > 10 || maxLen == 0 {
 		bm.resetBits()
-		return
+		return nil
 	}
 	if !matchMinMaxValueLen(ch, minLen, maxLen) {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint32String(bs, bb, v)
 		return matchLenRange(s, minLen, maxLen)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint64ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) {
+func matchUint64ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) error {
 	if minLen > 20 || maxLen == 0 {
 		bm.resetBits()
-		return
+		return nil
 	}
 	if !matchMinMaxValueLen(ch, minLen, maxLen) {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint64String(bs, bb, v)
 		return matchLenRange(s, minLen, maxLen)
 	})
-	bbPool.Put(bb)
 }
 
-func matchInt64ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) {
+func matchInt64ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen, maxLen uint64) error {
 	if minLen > 21 || maxLen == 0 {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 
 	bb.B = marshalInt64String(bb.B[:0], int64(ch.minValue))
 	maxvLen := len(bb.B)
@@ -326,15 +338,13 @@ func matchInt64ByLenRange(bs *blockSearch, ch *columnHeader, bm *bitmap, minLen,
 	}
 	if uint64(maxvLen) < minLen {
 		bm.resetBits()
-		return
+		return nil
 	}
 
-	visitValues(bs, ch, bm, func(v string) bool {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toInt64String(bs, bb, v)
 		return matchLenRange(s, minLen, maxLen)
 	})
-
-	bbPool.Put(bb)
 }
 
 func matchLenRange(s string, minLen, maxLen uint64) bool {

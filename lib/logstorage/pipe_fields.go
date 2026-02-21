@@ -69,7 +69,7 @@ func (pf *pipeFields) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pf *pipeFields) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pf *pipeFields) newPipeProcessor(_ int, _ <-chan struct{}, _ func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeFieldsProcessor{
 		pf:     pf,
 		ppNext: ppNext,
@@ -90,9 +90,7 @@ func (pfp *pipeFieldsProcessor) writeBlock(workerID uint, br *blockResult) {
 	pfp.ppNext.writeBlock(workerID, br)
 }
 
-func (pfp *pipeFieldsProcessor) flush() error {
-	return nil
-}
+func (pfp *pipeFieldsProcessor) flush() {}
 
 func parsePipeFields(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("fields", "keep") {

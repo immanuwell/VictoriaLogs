@@ -80,13 +80,13 @@ func (fr *filterIPv6Range) matchRowByField(fields []Field, fieldName string) boo
 	return matchIPv6Range(v, fr.minValue, fr.maxValue)
 }
 
-func (fr *filterIPv6Range) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fr *filterIPv6Range) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	minValue := fr.minValue
 	maxValue := fr.maxValue
 
 	if ipv6Less(maxValue, minValue) {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	c := br.getColumnByName(fieldName)
@@ -95,22 +95,26 @@ func (fr *filterIPv6Range) applyToBlockResultByField(br *blockResult, bm *bitmap
 		if !matchIPv6Range(v, minValue, maxValue) {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 	if c.isTime {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := values[idx]
 			return matchIPv6Range(v, minValue, maxValue)
 		})
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range c.dictValues {
 			c := byte(0)
 			if matchIPv6Range(v, minValue, maxValue) {
@@ -118,12 +122,14 @@ func (fr *filterIPv6Range) applyToBlockResultByField(br *blockResult, bm *bitmap
 			}
 			bb.B = append(bb.B, c)
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			n := valuesEncoded[idx][0]
 			return bb.B[n] == 1
 		})
-		bbPool.Put(bb)
 	case valueTypeUint8:
 		bm.resetBits()
 	case valueTypeUint16:
@@ -141,7 +147,10 @@ func (fr *filterIPv6Range) applyToBlockResultByField(br *blockResult, bm *bitmap
 		if !ok {
 			bm.resetBits()
 		} else {
-			valuesEncoded := c.getValuesEncoded(br)
+			valuesEncoded, err := c.getValuesEncoded(br)
+			if err != nil {
+				return err
+			}
 			bm.forEachSetBit(func(idx int) bool {
 				ip := unmarshalIPv4(valuesEncoded[idx])
 				return ip >= minValue4 && ip <= maxValue4
@@ -152,38 +161,45 @@ func (fr *filterIPv6Range) applyToBlockResultByField(br *blockResult, bm *bitmap
 	default:
 		logger.Panicf("FATAL: unknown valueType=%d", c.valueType)
 	}
+	return nil
 }
 
-func (fr *filterIPv6Range) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fr *filterIPv6Range) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	minValue := fr.minValue
 	maxValue := fr.maxValue
 
 	if ipv6Less(maxValue, minValue) {
 		bm.resetBits()
-		return
+		return nil
 	}
 
-	v := bs.getConstColumnValue(fieldName)
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil {
+		return err
+	}
 	if v != "" {
 		if !matchIPv6Range(v, minValue, maxValue) {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 
 	// Verify whether filter matches other columns
-	ch := bs.getColumnHeader(fieldName)
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil {
+		return err
+	}
 	if ch == nil {
 		// Fast path - there are no matching columns.
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	switch ch.valueType {
 	case valueTypeString:
-		matchStringByIPv6Range(bs, ch, bm, minValue, maxValue)
+		return matchStringByIPv6Range(bs, ch, bm, minValue, maxValue)
 	case valueTypeDict:
-		matchValuesDictByIPv6Range(bs, ch, bm, minValue, maxValue)
+		return matchValuesDictByIPv6Range(bs, ch, bm, minValue, maxValue)
 	case valueTypeUint8:
 		bm.resetBits()
 	case valueTypeUint16:
@@ -201,17 +217,19 @@ func (fr *filterIPv6Range) applyToBlockSearchByField(bs *blockSearch, bm *bitmap
 		if !ok {
 			bm.resetBits()
 		} else {
-			matchIPv4ByRange(bs, ch, bm, minValue4, maxValue4)
+			return matchIPv4ByRange(bs, ch, bm, minValue4, maxValue4)
 		}
 	case valueTypeTimestampISO8601:
 		bm.resetBits()
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
-func matchValuesDictByIPv6Range(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue [16]byte) {
+func matchValuesDictByIPv6Range(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue [16]byte) error {
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 	for _, v := range ch.valuesDict.values {
 		c := byte(0)
 		if matchIPv6Range(v, minValue, maxValue) {
@@ -219,12 +237,11 @@ func matchValuesDictByIPv6Range(bs *blockSearch, ch *columnHeader, bm *bitmap, m
 		}
 		bb.B = append(bb.B, c)
 	}
-	matchEncodedValuesDict(bs, ch, bm, bb.B)
-	bbPool.Put(bb)
+	return matchEncodedValuesDict(bs, ch, bm, bb.B)
 }
 
-func matchStringByIPv6Range(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue [16]byte) {
-	visitValues(bs, ch, bm, func(v string) bool {
+func matchStringByIPv6Range(bs *blockSearch, ch *columnHeader, bm *bitmap, minValue, maxValue [16]byte) error {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		return matchIPv6Range(v, minValue, maxValue)
 	})
 }

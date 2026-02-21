@@ -76,115 +76,117 @@ func (fs *filterSequence) matchRowByField(fields []Field, fieldName string) bool
 	return matchSequence(v, phrases)
 }
 
-func (fs *filterSequence) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fs *filterSequence) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	phrases := fs.getNonEmptyPhrases()
 	if len(phrases) == 0 {
-		return
+		return nil
 	}
 
-	applyToBlockResultGeneric(br, bm, fieldName, "", func(v, _ string) bool {
+	return applyToBlockResultGeneric(br, bm, fieldName, "", func(v, _ string) bool {
 		return matchSequence(v, phrases)
 	})
 }
 
-func (fs *filterSequence) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fs *filterSequence) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	phrases := fs.getNonEmptyPhrases()
 
 	if len(phrases) == 0 {
-		return
+		return nil
 	}
 
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if !matchSequence(v, phrases) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether filter matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		// Fast path - there are no matching columns.
 		// It matches anything only for empty phrase.
 		if !matchSequence("", phrases) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	tokens := fs.getTokensHashes()
 
 	switch ch.valueType {
 	case valueTypeString:
-		matchStringBySequence(bs, ch, bm, phrases, tokens)
+		return matchStringBySequence(bs, ch, bm, phrases, tokens)
 	case valueTypeDict:
-		matchValuesDictBySequence(bs, ch, bm, phrases)
+		return matchValuesDictBySequence(bs, ch, bm, phrases)
 	case valueTypeUint8:
-		matchUint8BySequence(bs, ch, bm, phrases, tokens)
+		return matchUint8BySequence(bs, ch, bm, phrases, tokens)
 	case valueTypeUint16:
-		matchUint16BySequence(bs, ch, bm, phrases, tokens)
+		return matchUint16BySequence(bs, ch, bm, phrases, tokens)
 	case valueTypeUint32:
-		matchUint32BySequence(bs, ch, bm, phrases, tokens)
+		return matchUint32BySequence(bs, ch, bm, phrases, tokens)
 	case valueTypeUint64:
-		matchUint64BySequence(bs, ch, bm, phrases, tokens)
+		return matchUint64BySequence(bs, ch, bm, phrases, tokens)
 	case valueTypeInt64:
-		matchInt64BySequence(bs, ch, bm, phrases, tokens)
+		return matchInt64BySequence(bs, ch, bm, phrases, tokens)
 	case valueTypeFloat64:
-		matchFloat64BySequence(bs, ch, bm, phrases, tokens)
+		return matchFloat64BySequence(bs, ch, bm, phrases, tokens)
 	case valueTypeIPv4:
-		matchIPv4BySequence(bs, ch, bm, phrases, tokens)
+		return matchIPv4BySequence(bs, ch, bm, phrases, tokens)
 	case valueTypeTimestampISO8601:
-		matchTimestampISO8601BySequence(bs, ch, bm, phrases, tokens)
+		return matchTimestampISO8601BySequence(bs, ch, bm, phrases, tokens)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
-func matchTimestampISO8601BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) {
+func matchTimestampISO8601BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) error {
 	if len(phrases) == 1 {
-		matchTimestampISO8601ByPhrase(bs, ch, bm, phrases[0], tokens)
-		return
+		return matchTimestampISO8601ByPhrase(bs, ch, bm, phrases[0], tokens)
 	}
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 
 	// Slow path - phrases contain incomplete timestamp. Search over string representation of the timestamp.
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toTimestampISO8601String(bs, bb, v)
 		return matchSequence(s, phrases)
 	})
-	bbPool.Put(bb)
 }
 
-func matchIPv4BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) {
+func matchIPv4BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) error {
 	if len(phrases) == 1 {
-		matchIPv4ByPhrase(bs, ch, bm, phrases[0], tokens)
-		return
+		return matchIPv4ByPhrase(bs, ch, bm, phrases[0], tokens)
 	}
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 
 	// Slow path - phrases contain parts of IP address. For example, `1.23` should match `1.23.4.5` and `4.1.23.54`.
 	// We cannot compare binary representation of ip address and need converting
 	// the ip to string before searching for prefix there.
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toIPv4String(bs, bb, v)
 		return matchSequence(s, phrases)
 	})
-	bbPool.Put(bb)
 }
 
-func matchFloat64BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchFloat64BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
 	// The phrase may contain a part of the floating-point number.
 	// For example, `foo:"123"` must match `123`, `123.456` and `-0.123`.
@@ -192,15 +194,16 @@ func matchFloat64BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phras
 	// Instead, we need searching for the whole phrase in string representation
 	// of floating-point numbers :(
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toFloat64String(bs, bb, v)
 		return matchSequence(s, phrases)
 	})
-	bbPool.Put(bb)
 }
 
-func matchValuesDictBySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string) {
+func matchValuesDictBySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string) error {
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 	for _, v := range ch.valuesDict.values {
 		c := byte(0)
 		if matchSequence(v, phrases) {
@@ -208,58 +211,58 @@ func matchValuesDictBySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, ph
 		}
 		bb.B = append(bb.B, c)
 	}
-	matchEncodedValuesDict(bs, ch, bm, bb.B)
-	bbPool.Put(bb)
+	return matchEncodedValuesDict(bs, ch, bm, bb.B)
 }
 
-func matchStringBySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchStringBySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return err
 	}
-	visitValues(bs, ch, bm, func(v string) bool {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		return matchSequence(v, phrases)
 	})
 }
 
-func matchUint8BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) {
+func matchUint8BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) error {
 	if len(phrases) > 1 {
 		bm.resetBits()
-		return
+		return nil
 	}
-	matchUint8ByExactValue(bs, ch, bm, phrases[0], tokens)
+	return matchUint8ByExactValue(bs, ch, bm, phrases[0], tokens)
 }
 
-func matchUint16BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) {
+func matchUint16BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) error {
 	if len(phrases) > 1 {
 		bm.resetBits()
-		return
+		return nil
 	}
-	matchUint16ByExactValue(bs, ch, bm, phrases[0], tokens)
+	return matchUint16ByExactValue(bs, ch, bm, phrases[0], tokens)
 }
 
-func matchUint32BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) {
+func matchUint32BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) error {
 	if len(phrases) > 1 {
 		bm.resetBits()
-		return
+		return nil
 	}
-	matchUint32ByExactValue(bs, ch, bm, phrases[0], tokens)
+	return matchUint32ByExactValue(bs, ch, bm, phrases[0], tokens)
 }
 
-func matchUint64BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) {
+func matchUint64BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) error {
 	if len(phrases) > 1 {
 		bm.resetBits()
-		return
+		return nil
 	}
-	matchUint64ByExactValue(bs, ch, bm, phrases[0], tokens)
+	return matchUint64ByExactValue(bs, ch, bm, phrases[0], tokens)
 }
 
-func matchInt64BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) {
+func matchInt64BySequence(bs *blockSearch, ch *columnHeader, bm *bitmap, phrases []string, tokens []uint64) error {
 	if len(phrases) > 1 {
 		bm.resetBits()
-		return
+		return nil
 	}
-	matchInt64ByExactValue(bs, ch, bm, phrases[0], tokens)
+	return matchInt64ByExactValue(bs, ch, bm, phrases[0], tokens)
 }
 
 func matchSequence(s string, phrases []string) bool {

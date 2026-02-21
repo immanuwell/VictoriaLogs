@@ -31,7 +31,7 @@ type statsCountEmptyProcessor struct {
 	rowsCount uint64
 }
 
-func (scp *statsCountEmptyProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (scp *statsCountEmptyProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sc := sf.(*statsCountEmpty)
 
 	if isSingleField(sc.fieldFilters) {
@@ -41,14 +41,18 @@ func (scp *statsCountEmptyProcessor) updateStatsForAllRows(sf statsFunc, br *blo
 			if c.valuesEncoded[0] == "" {
 				scp.rowsCount += uint64(br.rowsLen)
 			}
-			return 0
+			return 0, nil
 		}
 		if c.isTime {
-			return 0
+			return 0, nil
 		}
 		switch c.valueType {
 		case valueTypeString:
-			for _, v := range c.getValuesEncoded(br) {
+			valuesEncoded, err := c.getValuesEncoded(br)
+			if err != nil {
+				return 0, err
+			}
+			for _, v := range valuesEncoded {
 				if v == "" {
 					scp.rowsCount++
 				}
@@ -56,9 +60,13 @@ func (scp *statsCountEmptyProcessor) updateStatsForAllRows(sf statsFunc, br *blo
 		case valueTypeDict:
 			zeroDictIdx := slices.Index(c.dictValues, "")
 			if zeroDictIdx < 0 {
-				return 0
+				return 0, nil
 			}
-			for _, v := range c.getValuesEncoded(br) {
+			valuesEncoded, err := c.getValuesEncoded(br)
+			if err != nil {
+				return 0, err
+			}
+			for _, v := range valuesEncoded {
 				if int(v[0]) == zeroDictIdx {
 					scp.rowsCount++
 				}
@@ -68,7 +76,7 @@ func (scp *statsCountEmptyProcessor) updateStatsForAllRows(sf statsFunc, br *blo
 		default:
 			logger.Panicf("BUG: unknown valueType=%d", c.valueType)
 		}
-		return 0
+		return 0, nil
 	}
 
 	// Slow path - count rows containing empty value for all the fields enumerated inside count_empty().
@@ -85,42 +93,48 @@ func (scp *statsCountEmptyProcessor) updateStatsForAllRows(sf statsFunc, br *blo
 
 		if c.isConst {
 			if c.valuesEncoded[0] != "" {
-				return 0
+				return 0, nil
 			}
 			continue
 		}
 		if c.isTime {
-			return 0
+			return 0, nil
 		}
 		switch c.valueType {
 		case valueTypeString:
-			valuesEncoded := c.getValuesEncoded(br)
+			valuesEncoded, err := c.getValuesEncoded(br)
+			if err != nil {
+				return 0, err
+			}
 			bm.forEachSetBit(func(i int) bool {
 				return valuesEncoded[i] == ""
 			})
 		case valueTypeDict:
 			zeroDictIdx := slices.Index(c.dictValues, "")
 			if zeroDictIdx < 0 {
-				return 0
+				return 0, nil
 			}
-			valuesEncoded := c.getValuesEncoded(br)
+			valuesEncoded, err := c.getValuesEncoded(br)
+			if err != nil {
+				return 0, err
+			}
 			bm.forEachSetBit(func(i int) bool {
 				return int(valuesEncoded[i][0]) == zeroDictIdx
 			})
 		case valueTypeUint8, valueTypeUint16, valueTypeUint32, valueTypeUint64, valueTypeInt64,
 			valueTypeFloat64, valueTypeIPv4, valueTypeTimestampISO8601:
-			return 0
+			return 0, nil
 		default:
 			logger.Panicf("BUG: unknown valueType=%d", c.valueType)
-			return 0
+			return 0, nil
 		}
 	}
 
 	scp.rowsCount += uint64(bm.onesCount())
-	return 0
+	return 0, nil
 }
 
-func (scp *statsCountEmptyProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (scp *statsCountEmptyProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sc := sf.(*statsCountEmpty)
 
 	if isSingleField(sc.fieldFilters) {
@@ -130,19 +144,25 @@ func (scp *statsCountEmptyProcessor) updateStatsForRow(sf statsFunc, br *blockRe
 			if c.valuesEncoded[0] == "" {
 				scp.rowsCount++
 			}
-			return 0
+			return 0, nil
 		}
 		if c.isTime {
-			return 0
+			return 0, nil
 		}
 		switch c.valueType {
 		case valueTypeString:
-			valuesEncoded := c.getValuesEncoded(br)
+			valuesEncoded, err := c.getValuesEncoded(br)
+			if err != nil {
+				return 0, err
+			}
 			if v := valuesEncoded[rowIdx]; v == "" {
 				scp.rowsCount++
 			}
 		case valueTypeDict:
-			valuesEncoded := c.getValuesEncoded(br)
+			valuesEncoded, err := c.getValuesEncoded(br)
+			if err != nil {
+				return 0, err
+			}
 			dictIdx := valuesEncoded[rowIdx][0]
 			if v := c.dictValues[dictIdx]; v == "" {
 				scp.rowsCount++
@@ -152,7 +172,7 @@ func (scp *statsCountEmptyProcessor) updateStatsForRow(sf statsFunc, br *blockRe
 		default:
 			logger.Panicf("BUG: unknown valueType=%d", c.valueType)
 		}
-		return 0
+		return 0, nil
 	}
 
 	// Slow path - count the row at rowIdx if at least a single field enumerated inside count() is non-empty
@@ -161,12 +181,12 @@ func (scp *statsCountEmptyProcessor) updateStatsForRow(sf statsFunc, br *blockRe
 		if !prefixfilter.MatchFilters(sc.fieldFilters, c.name) {
 			continue
 		}
-		if v := c.getValueAtRow(br, rowIdx); v != "" {
-			return 0
+		if v, err := c.getValueAtRow(br, rowIdx); err != nil || v != "" {
+			return 0, err
 		}
 	}
 	scp.rowsCount++
-	return 0
+	return 0, nil
 }
 
 func (scp *statsCountEmptyProcessor) mergeState(_ *chunkedAllocator, _ statsFunc, sfp statsProcessor) {

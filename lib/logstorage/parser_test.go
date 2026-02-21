@@ -83,27 +83,44 @@ func TestApplyOptionTimeOffset(t *testing.T) {
 	f("options(time_offset=1h) _time:offset 1h", math.MinInt64, -nsecsPerHour*2)
 	f("options(time_offset=-1h) _time:offset 1h", math.MinInt64, 0)
 
+	// Use a positive "now" so relative time bounds don't land before the Unix epoch.
+	const nowForRelative = nsecsPerHour * 4
+	g := func(s string, expectedStart, expectedEnd int64) {
+		t.Helper()
+		q, err := ParseQueryAtTimestamp(s, nowForRelative)
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		gotStart, gotEnd := q.GetFilterTimeRange()
+		if gotStart != expectedStart {
+			t.Fatalf("unexpected start time; got %d; want %d", gotStart, expectedStart)
+		}
+		if gotEnd != expectedEnd {
+			t.Fatalf("unexpected end time; got %d; want %d", gotEnd, expectedEnd)
+		}
+	}
+
 	// range time filter
 	f("_time:[2025-07-26T00:00:00Z, 2025-07-29T00:00:00Z)", 1753488000000000000, 1753747199999999999)
 	f("options(time_offset=1d) _time:[2025-07-26T00:00:00Z, 2025-07-29T00:00:00Z)", 1753401600000000000, 1753660799999999999)
-	f("options(time_offset=1h) _time:[2h, 1h)", -nsecsPerHour*3, -nsecsPerHour*2-1)
-	f("options(time_offset=1h) _time:[2h, now)", -nsecsPerHour*3, -nsecsPerHour*1-1)
+	g("options(time_offset=1h) _time:[2h, 1h)", nowForRelative-nsecsPerHour*3, nowForRelative-nsecsPerHour*2-1)
+	g("options(time_offset=1h) _time:[2h, now)", nowForRelative-nsecsPerHour*3, nowForRelative-nsecsPerHour*1-1)
 
 	// gt time filter
 	f("_time:>2025-07-25T01:00:00Z", 1753405200000000001, math.MaxInt64)
 	f("_time:>=2025-07-25T01:00:00Z", 1753405200000000000, math.MaxInt64)
 	f("options(time_offset=1h) _time:>2025-07-25T01:00:00Z", 1753405200000000001-nsecsPerHour*1, math.MaxInt64)
 	f("options(time_offset=-1h) _time:>2025-07-25T01:00:00Z", 1753405200000000001+nsecsPerHour*1, math.MaxInt64)
-	f("options(time_offset=1h) _time:>2h", math.MinInt64, -nsecsPerHour*3-1)
-	f("options(time_offset=1h5m3s) _time:>=2h", math.MinInt64, -nsecsPerHour*3-5*nsecsPerMinute-3*nsecsPerSecond)
-	f("options(time_offset=-1h5m3s) _time:>=2h", math.MinInt64, -nsecsPerHour*1+5*nsecsPerMinute+3*nsecsPerSecond)
+	g("options(time_offset=1h) _time:>2h", math.MinInt64, nowForRelative-nsecsPerHour*3-1)
+	g("options(time_offset=1h5m3s) _time:>=2h", math.MinInt64, nowForRelative-nsecsPerHour*3-5*nsecsPerMinute-3*nsecsPerSecond)
+	g("options(time_offset=-1h5m3s) _time:>=2h", math.MinInt64, nowForRelative-nsecsPerHour*1+5*nsecsPerMinute+3*nsecsPerSecond)
 
 	// lt time filter
 	f("_time:<2025-07-25T12:00:00Z", math.MinInt64, 1753444799999999999)
 	f("options(time_offset=1h) _time:<2025-07-25T12:00:00Z", math.MinInt64, 1753444799999999999-nsecsPerHour*1)
 	f("options(time_offset=-1h) _time:<2025-07-25T12:00:00Z", math.MinInt64, 1753444799999999999+nsecsPerHour*1)
-	f("options(time_offset=1h) _time:<2h", -nsecsPerHour*3+1, -nsecsPerHour-1)
-	f("options(time_offset=1h) _time:<=2h", -nsecsPerHour*3, -nsecsPerHour-1)
+	g("options(time_offset=1h) _time:<2h", nowForRelative-nsecsPerHour*3+1, nowForRelative-nsecsPerHour-1)
+	g("options(time_offset=1h) _time:<=2h", nowForRelative-nsecsPerHour*3, nowForRelative-nsecsPerHour-1)
 }
 
 func TestApplyOptionTimeOffsetToSubqueries(t *testing.T) {

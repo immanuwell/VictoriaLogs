@@ -85,7 +85,7 @@ func (pr *pipeRename) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pr *pipeRename) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pr *pipeRename) newPipeProcessor(_ int, _ <-chan struct{}, _ func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeRenameProcessor{
 		pr:     pr,
 		ppNext: ppNext,
@@ -106,9 +106,7 @@ func (prp *pipeRenameProcessor) writeBlock(workerID uint, br *blockResult) {
 	prp.ppNext.writeBlock(workerID, br)
 }
 
-func (prp *pipeRenameProcessor) flush() error {
-	return nil
-}
+func (prp *pipeRenameProcessor) flush() {}
 
 func parsePipeRename(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("rename", "mv") {

@@ -51,43 +51,53 @@ type statsUniqValuesProcessor struct {
 	ms []map[string]struct{}
 }
 
-func (sup *statsUniqValuesProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (sup *statsUniqValuesProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	su := sf.(*statsUniqValues)
 
 	if sup.limitReached(su) {
 		// Limit on the number of unique values has been reached
-		return 0
+		return 0, nil
 	}
 
 	stateSizeIncrease := 0
 
 	mc := getMatchingColumns(br, su.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		stateSizeIncrease += sup.updateStatsForAllRowsColumn(c, br)
+		state, err := sup.updateStatsForAllRowsColumn(c, br)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
 	}
-	putMatchingColumns(mc)
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (sup *statsUniqValuesProcessor) updateStatsForAllRowsColumn(c *blockResultColumn, br *blockResult) int {
+func (sup *statsUniqValuesProcessor) updateStatsForAllRowsColumn(c *blockResultColumn, br *blockResult) (int, error) {
 	if c.isConst {
 		// collect unique const values
 		v := c.valuesEncoded[0]
-		return sup.updateState(v)
+		return sup.updateState(v), nil
 	}
 
 	stateSizeIncrease := 0
 	if c.valueType == valueTypeDict {
 		// collect unique non-zero c.dictValues
-		c.forEachDictValue(br, func(v string) {
+		err := c.forEachDictValue(br, func(v string) {
 			stateSizeIncrease += sup.updateState(v)
 		})
-		return stateSizeIncrease
+		if err != nil {
+			return 0, err
+		}
+		return stateSizeIncrease, nil
 	}
 
 	// slow path - collect unique values across all rows
-	values := c.getValues(br)
+	values, err := c.getValues(br)
+	if err != nil {
+		return 0, err
+	}
 	for i, v := range values {
 		if i > 0 && values[i-1] == v {
 			// This value has been already counted.
@@ -95,46 +105,56 @@ func (sup *statsUniqValuesProcessor) updateStatsForAllRowsColumn(c *blockResultC
 		}
 		stateSizeIncrease += sup.updateState(v)
 	}
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (sup *statsUniqValuesProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (sup *statsUniqValuesProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	su := sf.(*statsUniqValues)
 
 	if sup.limitReached(su) {
 		// Limit on the number of unique values has been reached
-		return 0
+		return 0, nil
 	}
 
 	stateSizeIncrease := 0
 
 	mc := getMatchingColumns(br, su.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		stateSizeIncrease += sup.updateStatsForRowColumn(c, br, rowIdx)
+		state, err := sup.updateStatsForRowColumn(c, br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
 	}
-	putMatchingColumns(mc)
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (sup *statsUniqValuesProcessor) updateStatsForRowColumn(c *blockResultColumn, br *blockResult, rowIdx int) int {
+func (sup *statsUniqValuesProcessor) updateStatsForRowColumn(c *blockResultColumn, br *blockResult, rowIdx int) (int, error) {
 	if c.isConst {
 		// collect unique const values
 		v := c.valuesEncoded[0]
-		return sup.updateState(v)
+		return sup.updateState(v), nil
 	}
 
 	if c.valueType == valueTypeDict {
 		// collect unique non-zero c.dictValues
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		dictIdx := valuesEncoded[rowIdx][0]
 		v := c.dictValues[dictIdx]
-		return sup.updateState(v)
+		return sup.updateState(v), nil
 	}
 
 	// collect unique values for the given rowIdx.
-	v := c.getValueAtRow(br, rowIdx)
-	return sup.updateState(v)
+	v, err := c.getValueAtRow(br, rowIdx)
+	if err != nil {
+		return 0, err
+	}
+	return sup.updateState(v), nil
 }
 
 func (sup *statsUniqValuesProcessor) mergeState(_ *chunkedAllocator, sf statsFunc, sfp statsProcessor) {

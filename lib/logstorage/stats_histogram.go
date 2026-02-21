@@ -39,7 +39,7 @@ type statsHistogramProcessor struct {
 	bucketsMap map[string]uint64
 }
 
-func (shp *statsHistogramProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (shp *statsHistogramProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sh := sf.(*statsHistogram)
 
 	c := br.getColumnByName(sh.fieldName)
@@ -51,42 +51,60 @@ func (shp *statsHistogramProcessor) updateStatsForAllRows(sf statsFunc, br *bloc
 				shp.h.Update(f)
 			}
 		}
-		return 0
+		return 0, nil
 	}
 
 	switch c.valueType {
 	case valueTypeUint8:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for _, v := range values {
 			n := unmarshalUint8(v)
 			shp.h.Update(float64(n))
 		}
 	case valueTypeUint16:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for _, v := range values {
 			n := unmarshalUint16(v)
 			shp.h.Update(float64(n))
 		}
 	case valueTypeUint32:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for _, v := range values {
 			n := unmarshalUint32(v)
 			shp.h.Update(float64(n))
 		}
 	case valueTypeUint64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for _, v := range values {
 			n := unmarshalUint64(v)
 			shp.h.Update(float64(n))
 		}
 	case valueTypeInt64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for _, v := range values {
 			n := unmarshalInt64(v)
 			shp.h.Update(float64(n))
 		}
 	case valueTypeFloat64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for _, v := range values {
 			f := unmarshalFloat64(v)
 			shp.h.Update(f)
@@ -96,7 +114,10 @@ func (shp *statsHistogramProcessor) updateStatsForAllRows(sf statsFunc, br *bloc
 	case valueTypeTimestampISO8601:
 		// skip iso8601 values, since they cannot be represented as numbers
 	default:
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return 0, err
+		}
 		for _, v := range values {
 			f, ok := tryParseNumber(v)
 			if ok {
@@ -105,10 +126,10 @@ func (shp *statsHistogramProcessor) updateStatsForAllRows(sf statsFunc, br *bloc
 		}
 	}
 
-	return 0
+	return 0, nil
 }
 
-func (shp *statsHistogramProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (shp *statsHistogramProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sh := sf.(*statsHistogram)
 
 	c := br.getColumnByName(sh.fieldName)
@@ -118,37 +139,55 @@ func (shp *statsHistogramProcessor) updateStatsForRow(sf statsFunc, br *blockRes
 		if ok {
 			shp.h.Update(f)
 		}
-		return 0
+		return 0, nil
 	}
 
 	switch c.valueType {
 	case valueTypeUint8:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		n := unmarshalUint8(v)
 		shp.h.Update(float64(n))
 	case valueTypeUint16:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		n := unmarshalUint16(v)
 		shp.h.Update(float64(n))
 	case valueTypeUint32:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		n := unmarshalUint32(v)
 		shp.h.Update(float64(n))
 	case valueTypeUint64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		n := unmarshalUint64(v)
 		shp.h.Update(float64(n))
 	case valueTypeInt64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		n := unmarshalInt64(v)
 		shp.h.Update(float64(n))
 	case valueTypeFloat64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		f := unmarshalFloat64(v)
 		shp.h.Update(f)
@@ -157,14 +196,17 @@ func (shp *statsHistogramProcessor) updateStatsForRow(sf statsFunc, br *blockRes
 	case valueTypeTimestampISO8601:
 		// skip iso8601 values, since they cannot be represented as numbers
 	default:
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
 		f, ok := tryParseNumber(v)
 		if ok {
 			shp.h.Update(f)
 		}
 	}
 
-	return 0
+	return 0, nil
 }
 
 func (shp *statsHistogramProcessor) mergeState(_ *chunkedAllocator, _ statsFunc, sfp statsProcessor) {

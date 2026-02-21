@@ -61,10 +61,11 @@ func (pl *pipeLen) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pl *pipeLen) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pl *pipeLen) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	plp := &pipeLenProcessor{
 		pl:     pl,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 	plp.shards.Init = func(shard *pipeLenProcessorShard) {
 		shard.reset()
@@ -77,6 +78,7 @@ type pipeLenProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeLenProcessorShard]
+	cancel func(error)
 }
 
 type pipeLenProcessorShard struct {
@@ -104,7 +106,11 @@ func (plp *pipeLenProcessor) writeBlock(workerID uint, br *blockResult) {
 		br.addResultColumnConst(shard.rc)
 	} else {
 		// Slow path for other columns
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			plp.cancel(err)
+			return
+		}
 		vEncoded := ""
 		for rowIdx := range values {
 			if rowIdx == 0 || values[rowIdx] != values[rowIdx-1] {
@@ -145,9 +151,7 @@ func (shard *pipeLenProcessorShard) getEncodedLen(v string) string {
 	return bytesutil.ToUnsafeString(shard.a.b[bLen:])
 }
 
-func (plp *pipeLenProcessor) flush() error {
-	return nil
-}
+func (plp *pipeLenProcessor) flush() {}
 
 func parsePipeLen(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("len") {

@@ -1448,7 +1448,8 @@ type commonArgs struct {
 }
 
 func (ca *commonArgs) newQueryContext(ctx context.Context) *logstorage.QueryContext {
-	return logstorage.NewQueryContext(ctx, &ca.qs, ca.tenantIDs, ca.q, ca.allowPartialResponse, ca.hiddenFieldsFilters)
+	qctx, cancel := context.WithCancelCause(ctx)
+	return logstorage.NewQueryContext(qctx, cancel, &ca.qs, ca.tenantIDs, ca.q, ca.allowPartialResponse, ca.hiddenFieldsFilters)
 }
 
 func (ca *commonArgs) updatePerQueryStatsMetrics() {

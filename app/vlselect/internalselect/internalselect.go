@@ -427,7 +427,8 @@ type commonParams struct {
 }
 
 func (cp *commonParams) NewQueryContext(ctx context.Context) *logstorage.QueryContext {
-	return logstorage.NewQueryContext(ctx, &cp.qs, cp.TenantIDs, cp.Query, cp.AllowPartialResponse, cp.HiddenFieldsFilters)
+	qctx, cancel := context.WithCancelCause(ctx)
+	return logstorage.NewQueryContext(qctx, cancel, &cp.qs, cp.TenantIDs, cp.Query, cp.AllowPartialResponse, cp.HiddenFieldsFilters)
 }
 
 func (cp *commonParams) UpdatePerQueryStatsMetrics() {

@@ -1,4 +1,4 @@
-# github.com/VictoriaMetrics/VictoriaMetrics v1.143.0
+# github.com/VictoriaMetrics/VictoriaMetrics v1.140.1-0.20260414051809-8a20ccf21db7 => ../VictoriaMetrics
 ## explicit; go 1.26.3
 github.com/VictoriaMetrics/VictoriaMetrics/lib/appmetrics
 github.com/VictoriaMetrics/VictoriaMetrics/lib/atomicutil
@@ -30,6 +30,10 @@ github.com/VictoriaMetrics/VictoriaMetrics/lib/logger
 github.com/VictoriaMetrics/VictoriaMetrics/lib/memory
 github.com/VictoriaMetrics/VictoriaMetrics/lib/mergeset
 github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil
+github.com/VictoriaMetrics/VictoriaMetrics/lib/objectstorage
+github.com/VictoriaMetrics/VictoriaMetrics/lib/objectstorage/common
+github.com/VictoriaMetrics/VictoriaMetrics/lib/objectstorage/s3
+github.com/VictoriaMetrics/VictoriaMetrics/lib/objectstorage/testutil
 github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue
 github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil
 github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth
@@ -102,7 +106,7 @@ github.com/aws/aws-sdk-go-v2/credentials/stscreds
 ## explicit; go 1.24
 github.com/aws/aws-sdk-go-v2/feature/ec2/imds
 github.com/aws/aws-sdk-go-v2/feature/ec2/imds/internal/config
-# github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.11
+# github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.15
 ## explicit; go 1.24
 github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager
 github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types
@@ -261,16 +265,20 @@ github.com/valyala/quicktemplate
 golang.org/x/oauth2
 golang.org/x/oauth2/clientcredentials
 golang.org/x/oauth2/internal
-# golang.org/x/sys v0.43.0
+# golang.org/x/sync v0.20.0
+## explicit; go 1.25.0
+golang.org/x/sync/singleflight
+# golang.org/x/sys v0.45.0
 ## explicit; go 1.25.0
 golang.org/x/sys/cpu
 golang.org/x/sys/plan9
 golang.org/x/sys/unix
 golang.org/x/sys/windows
-# golang.org/x/text v0.36.0
+# golang.org/x/text v0.37.0
 ## explicit; go 1.25.0
 golang.org/x/text/transform
 golang.org/x/text/width
 # gopkg.in/yaml.v2 v2.4.0
 ## explicit; go 1.15
 gopkg.in/yaml.v2
+# github.com/VictoriaMetrics/VictoriaMetrics => ../VictoriaMetrics

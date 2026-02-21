@@ -32,38 +32,46 @@ type statsSumProcessor struct {
 	sum float64
 }
 
-func (ssp *statsSumProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (ssp *statsSumProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	ss := sf.(*statsSum)
 
 	mc := getMatchingColumns(br, ss.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		ssp.updateStateForColumn(br, c)
+		if err := ssp.updateStateForColumn(br, c); err != nil {
+			return 0, err
+		}
 	}
-	putMatchingColumns(mc)
 
-	return 0
+	return 0, nil
 }
 
-func (ssp *statsSumProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (ssp *statsSumProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	ss := sf.(*statsSum)
 
 	mc := getMatchingColumns(br, ss.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		f, ok := c.getFloatValueAtRow(br, rowIdx)
-		if ok {
+		f, ok, err := c.getFloatValueAtRow(br, rowIdx)
+		if err != nil {
+			return 0, err
+		} else if ok {
 			ssp.updateState(f)
 		}
 	}
-	putMatchingColumns(mc)
 
-	return 0
+	return 0, nil
 }
 
-func (ssp *statsSumProcessor) updateStateForColumn(br *blockResult, c *blockResultColumn) {
-	f, count := c.sumValues(br)
+func (ssp *statsSumProcessor) updateStateForColumn(br *blockResult, c *blockResultColumn) error {
+	f, count, err := c.sumValues(br)
+	if err != nil {
+		return err
+	}
 	if count > 0 {
 		ssp.updateState(f)
 	}
+	return nil
 }
 
 func (ssp *statsSumProcessor) updateState(f float64) {

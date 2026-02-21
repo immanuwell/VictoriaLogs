@@ -49,7 +49,7 @@ func (pf *pipeFirst) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pf *pipeFirst) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (pf *pipeFirst) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return newPipeTopkProcessor(pf.ps, stopCh, cancel, ppNext)
 }
 

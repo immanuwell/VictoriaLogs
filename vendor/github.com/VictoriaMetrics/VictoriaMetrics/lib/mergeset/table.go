@@ -19,6 +19,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/objectstorage/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/syncwg"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 )
@@ -83,6 +84,7 @@ type Table struct {
 	mergeIdx atomic.Uint64
 
 	path string
+	sc   common.StorageClient
 
 	// The interval for guaranteed flush of recently ingested data from memory to on-disk parts so they survive process crash.
 	flushInterval time.Duration
@@ -298,7 +300,7 @@ func (pw *partWrapper) incRef() {
 	pw.refCount.Add(1)
 }
 
-func (pw *partWrapper) decRef() {
+func (pw *partWrapper) decRef(isRemote bool) {
 	n := pw.refCount.Add(-1)
 	if n < 0 {
 		logger.Panicf("BUG: pw.refCount must be bigger than 0; got %d", n)
@@ -308,7 +310,7 @@ func (pw *partWrapper) decRef() {
 	}
 
 	deletePath := ""
-	if pw.mp == nil && pw.mustDrop.Load() {
+	if pw.mp == nil && !isRemote && pw.mustDrop.Load() {
 		deletePath = pw.p.path
 	}
 	if pw.mp != nil {
@@ -325,7 +327,16 @@ func (pw *partWrapper) decRef() {
 	}
 }
 
-// MustOpenTable opens a table on the given path.
+// MustOpenTable is same as OpenTable, but panics in case of error
+func MustOpenTable(sc common.StorageClient, path string, flushInterval time.Duration, flushCallback func(), prepareBlock PrepareBlockCallback, isReadOnly *atomic.Bool) *Table {
+	tb, err := OpenTable(sc, path, flushInterval, flushCallback, prepareBlock, isReadOnly)
+	if err != nil {
+		logger.Panicf("FATAL: %s", err)
+	}
+	return tb
+}
+
+// OpenTable opens a table on the given path.
 //
 // The flushInterval is the interval for flushing pending in-memory data to disk.
 //
@@ -336,7 +347,7 @@ func (pw *partWrapper) decRef() {
 // to persistent storage.
 //
 // The table is created if it doesn't exist yet.
-func MustOpenTable(path string, flushInterval time.Duration, flushCallback func(), prepareBlock PrepareBlockCallback, isReadOnly *atomic.Bool) *Table {
+func OpenTable(sc common.StorageClient, path string, flushInterval time.Duration, flushCallback func(), prepareBlock PrepareBlockCallback, isReadOnly *atomic.Bool) (*Table, error) {
 	path = filepath.Clean(path)
 
 	if flushInterval < pendingItemsFlushInterval {
@@ -345,16 +356,24 @@ func MustOpenTable(path string, flushInterval time.Duration, flushCallback func(
 		flushInterval = pendingItemsFlushInterval
 	}
 
-	// Create a directory at the path if it doesn't exist yet.
-	fs.MustMkdirIfNotExist(path)
+	var enableBackgroundWorkers bool
+	var pws []*partWrapper
+	isRemote := sc != nil
 
-	// Open table parts.
-	pws := mustOpenParts(path)
-
-	// Sync the path and the parent dir, so the path becomes visible in the parent dir.
-	fs.MustSyncPathAndParentDir(path)
+	if isRemote {
+		var err error
+		pws, err = getRemoteParts(sc, path)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// table on a local fs
+		enableBackgroundWorkers = true
+		pws = getLocalParts(path)
+	}
 
 	tb := &Table{
+		sc:                   sc,
 		path:                 path,
 		flushInterval:        flushInterval,
 		flushCallback:        flushCallback,
@@ -366,9 +385,64 @@ func MustOpenTable(path string, flushInterval time.Duration, flushCallback func(
 	}
 	tb.mergeIdx.Store(uint64(time.Now().UnixNano()))
 	tb.rawItems.init()
-	tb.startBackgroundWorkers()
 
-	return tb
+	if enableBackgroundWorkers {
+		tb.startBackgroundWorkers()
+	}
+
+	return tb, nil
+}
+
+func getLocalParts(path string) []*partWrapper {
+	// Create a directory at the path if it doesn't exist yet.
+	fs.MustMkdirIfNotExist(path)
+
+	// Open table parts.
+	pws := mustOpenParts(path)
+
+	// Sync the path and the parent dir, so the path becomes visible in the parent dir.
+	fs.MustSyncPathAndParentDir(path)
+	return pws
+}
+
+func getRemoteParts(sc common.StorageClient, path string) ([]*partWrapper, error) {
+	allPartFiles, err := sc.ListFiles(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list files at: %s: %w", sc.GetPath(path), err)
+	}
+
+	partsSize, ok := allPartFiles[partsFilename]
+	if !ok {
+		logger.Panicf("FATAL: parts file at %s was not found", sc.GetPath(path))
+	}
+
+	bb := common.GetWriteAtBuffer()
+	defer common.PutWriteAtBuffer(bb)
+	bb.Grow(int(partsSize))
+	bb.B = bb.B[:int(partsSize)]
+	partsFile := filepath.Join(path, partsFilename)
+	if err := sc.ReadFile(partsFile, bb); err != nil {
+		return nil, fmt.Errorf("cannot read %s: %w", sc.GetPath(partsFile), err)
+	}
+	var partNames []string
+	if err := json.Unmarshal(bb.B, &partNames); err != nil {
+		logger.Panicf("FATAL: cannot parse %s: %s", sc.GetPath(partsFile), err)
+	}
+
+	// Open parts
+	var pws []*partWrapper
+	for _, partName := range partNames {
+		p, err := openRemotePart(sc, allPartFiles, path, partName)
+		if err != nil {
+			return nil, fmt.Errorf("cannot open remote part %s: %w", sc.GetPath(filepath.Join(path, partName)), err)
+		}
+		pw := &partWrapper{
+			p: p,
+		}
+		pw.incRef()
+		pws = append(pws, pw)
+	}
+	return pws, nil
 }
 
 func (tb *Table) startBackgroundWorkers() {
@@ -481,6 +555,7 @@ func (tb *Table) MustClose() {
 	tb.partsLock.Lock()
 	close(tb.stopCh)
 	tb.partsLock.Unlock()
+	isRemote := tb.sc != nil
 
 	// Wait for background workers to stop.
 	tb.wg.Wait()
@@ -506,7 +581,7 @@ func (tb *Table) MustClose() {
 	tb.partsLock.Unlock()
 
 	for _, pw := range fileParts {
-		pw.decRef()
+		pw.decRef(isRemote)
 		if refCount := pw.refCount.Load(); refCount != 0 {
 			logger.Panicf("BUG: unexpected non-zero partWrapper.refCount when closing indexdb table: %d", refCount)
 		}
@@ -514,7 +589,10 @@ func (tb *Table) MustClose() {
 }
 
 // Path returns the path to tb on the filesystem.
-func (tb *Table) Path() string {
+func (tb *Table) Path(isAbs bool) string {
+	if isAbs {
+		return filepath.Join(tb.sc.GetRoot(), tb.path)
+	}
 	return tb.path
 }
 
@@ -675,8 +753,9 @@ func (tb *Table) getParts(dst []*partWrapper) []*partWrapper {
 
 // putParts releases the given pws obtained via getParts.
 func (tb *Table) putParts(pws []*partWrapper) {
+	isRemote := tb.sc != nil
 	for _, pw := range pws {
-		pw.decRef()
+		pw.decRef(isRemote)
 	}
 }
 
@@ -823,6 +902,35 @@ func (ris *rawItemsShard) appendBlocksToFlush(dst []*inmemoryBlock, currentTimeM
 	ris.mu.Unlock()
 
 	return dst
+}
+
+func (tb *Table) MustForceMergeAllParts() {
+	// Flush inmemory parts to files before forced merge
+	tb.flushInmemoryPartsToFiles(true)
+	maxOutBytes := tb.getMaxFilePartSize()
+
+	tb.partsLock.Lock()
+	pws := getPartsToMerge(tb.fileParts, maxOutBytes)
+	tb.partsLock.Unlock()
+
+	// If len(pws) == 1, then the merge must run anyway.
+	// This allows applying the configured retention, removing the deleted data, etc.
+
+	// Merge pws optimally
+	wg := getWaitGroup()
+	for len(pws) > 0 {
+		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
+		filePartsConcurrencyCh <- struct{}{}
+
+		wg.Go(func() {
+			tb.mergeParts(pwsToMerge, tb.stopCh, false)
+			<-filePartsConcurrencyCh
+		})
+
+		pws = pwsRemaining
+	}
+	wg.Wait()
+	putWaitGroup(wg)
 }
 
 func (tb *Table) flushBlocksToInmemoryParts(ibs []*inmemoryBlock, isFinal bool) {
@@ -977,8 +1085,9 @@ func (tb *Table) mustMergeInmemoryPartsFinal(pws []*partWrapper) *partWrapper {
 
 	flushToDiskDeadline := getFlushToDiskDeadline(pws, tb.flushInterval)
 	pw := tb.mustMergeIntoInmemoryPart(bsrs, flushToDiskDeadline)
+	isRemote := tb.sc != nil
 	for _, srcPW := range pws {
-		srcPW.decRef()
+		srcPW.decRef(isRemote)
 	}
 	return pw
 }
@@ -1408,9 +1517,10 @@ func (tb *Table) swapSrcWithDstParts(pws []*partWrapper, pwNew *partWrapper, dst
 
 	// Mark old parts as must be deleted and decrement reference count,
 	// so they are eventually closed and deleted.
+	isRemote := tb.sc != nil
 	for _, pw := range pws {
 		pw.mustDrop.Store(true)
-		pw.decRef()
+		pw.decRef(isRemote)
 	}
 }
 
@@ -1538,11 +1648,11 @@ func (tb *Table) MustCreateSnapshotAt(dstDir string) {
 	srcDir := tb.path
 	srcDir, err = filepath.Abs(srcDir)
 	if err != nil {
-		logger.Panicf("FATAL: cannot obtain absolute dir for %q: %w", srcDir, err)
+		logger.Panicf("FATAL: cannot obtain absolute dir for %q: %s", srcDir, err)
 	}
 	dstDir, err = filepath.Abs(dstDir)
 	if err != nil {
-		logger.Panicf("FATAL: cannot obtain absolute dir for %q: %w", dstDir, err)
+		logger.Panicf("FATAL: cannot obtain absolute dir for %q: %s", dstDir, err)
 	}
 	prefix := srcDir + string(filepath.Separator)
 	if strings.HasPrefix(dstDir, prefix) {

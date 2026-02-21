@@ -50,113 +50,130 @@ func (fep *filterExactPrefix) matchRowByField(fields []Field, fieldName string) 
 	return matchExactPrefix(v, fep.prefix)
 }
 
-func (fep *filterExactPrefix) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
-	applyToBlockResultGeneric(br, bm, fieldName, fep.prefix, matchExactPrefix)
+func (fep *filterExactPrefix) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
+	return applyToBlockResultGeneric(br, bm, fieldName, fep.prefix, matchExactPrefix)
 }
 
-func (fep *filterExactPrefix) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fep *filterExactPrefix) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	prefix := fep.prefix
 
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if !matchExactPrefix(v, prefix) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether filter matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		// Fast path - there are no matching columns.
 		if !matchExactPrefix("", prefix) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	tokens := fep.getTokensHashes()
 
 	switch ch.valueType {
 	case valueTypeString:
-		matchStringByExactPrefix(bs, ch, bm, prefix, tokens)
+		return matchStringByExactPrefix(bs, ch, bm, prefix, tokens)
 	case valueTypeDict:
-		matchValuesDictByExactPrefix(bs, ch, bm, prefix)
+		return matchValuesDictByExactPrefix(bs, ch, bm, prefix)
 	case valueTypeUint8:
-		matchUint8ByExactPrefix(bs, ch, bm, prefix, tokens)
+		return matchUint8ByExactPrefix(bs, ch, bm, prefix, tokens)
 	case valueTypeUint16:
-		matchUint16ByExactPrefix(bs, ch, bm, prefix, tokens)
+		return matchUint16ByExactPrefix(bs, ch, bm, prefix, tokens)
 	case valueTypeUint32:
-		matchUint32ByExactPrefix(bs, ch, bm, prefix, tokens)
+		return matchUint32ByExactPrefix(bs, ch, bm, prefix, tokens)
 	case valueTypeUint64:
-		matchUint64ByExactPrefix(bs, ch, bm, prefix, tokens)
+		return matchUint64ByExactPrefix(bs, ch, bm, prefix, tokens)
 	case valueTypeInt64:
-		matchInt64ByExactPrefix(bs, ch, bm, prefix, tokens)
+		return matchInt64ByExactPrefix(bs, ch, bm, prefix, tokens)
 	case valueTypeFloat64:
-		matchFloat64ByExactPrefix(bs, ch, bm, prefix, tokens)
+		return matchFloat64ByExactPrefix(bs, ch, bm, prefix, tokens)
 	case valueTypeIPv4:
-		matchIPv4ByExactPrefix(bs, ch, bm, prefix, tokens)
+		return matchIPv4ByExactPrefix(bs, ch, bm, prefix, tokens)
 	case valueTypeTimestampISO8601:
-		matchTimestampISO8601ByExactPrefix(bs, ch, bm, prefix, tokens)
+		return matchTimestampISO8601ByExactPrefix(bs, ch, bm, prefix, tokens)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
-func matchTimestampISO8601ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) {
+func matchTimestampISO8601ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) error {
 	if prefix == "" {
-		return
+		return nil
 	}
-	if prefix < "0" || prefix > "9" || !matchBloomFilterAllTokens(bs, ch, tokens) {
+	if prefix < "0" || prefix > "9" {
 		bm.resetBits()
-		return
+		return nil
+	}
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
+		bm.resetBits()
+		return err
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toTimestampISO8601String(bs, bb, v)
 		return matchExactPrefix(s, prefix)
 	})
-	bbPool.Put(bb)
 }
 
-func matchIPv4ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) {
+func matchIPv4ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) error {
 	if prefix == "" {
-		return
+		return nil
 	}
-	if prefix < "0" || prefix > "9" || len(tokens) > 3*bloomFilterHashesCount || !matchBloomFilterAllTokens(bs, ch, tokens) {
+	if prefix < "0" || prefix > "9" || len(tokens) > 3*bloomFilterHashesCount {
 		bm.resetBits()
-		return
+		return nil
+	}
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
+		bm.resetBits()
+		return err
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toIPv4String(bs, bb, v)
 		return matchExactPrefix(s, prefix)
 	})
-	bbPool.Put(bb)
 }
 
-func matchFloat64ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) {
+func matchFloat64ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) error {
 	if prefix == "" {
 		// An empty prefix matches all the values
-		return
+		return nil
 	}
-	if len(tokens) > 2*bloomFilterHashesCount || !matchBloomFilterAllTokens(bs, ch, tokens) {
+	if len(tokens) > 2*bloomFilterHashesCount {
 		bm.resetBits()
-		return
+		return nil
+	}
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
+		bm.resetBits()
+		return err
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toFloat64String(bs, bb, v)
 		return matchExactPrefix(s, prefix)
 	})
-	bbPool.Put(bb)
 }
 
-func matchValuesDictByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string) {
+func matchValuesDictByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string) error {
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 	for _, v := range ch.valuesDict.values {
 		c := byte(0)
 		if matchExactPrefix(v, prefix) {
@@ -164,97 +181,97 @@ func matchValuesDictByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap,
 		}
 		bb.B = append(bb.B, c)
 	}
-	matchEncodedValuesDict(bs, ch, bm, bb.B)
-	bbPool.Put(bb)
+	return matchEncodedValuesDict(bs, ch, bm, bb.B)
 }
 
-func matchStringByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) {
-	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+func matchStringByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) error {
+	matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+	if err != nil || !matches {
 		bm.resetBits()
-		return
+		return nil
 	}
-	visitValues(bs, ch, bm, func(v string) bool {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		return matchExactPrefix(v, prefix)
 	})
 }
 
-func matchUint8ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) {
+func matchUint8ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) error {
 	if !matchMinMaxExactPrefix(ch, bm, prefix, tokens) {
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint8String(bs, bb, v)
 		return matchExactPrefix(s, prefix)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint16ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) {
+func matchUint16ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) error {
 	if !matchMinMaxExactPrefix(ch, bm, prefix, tokens) {
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint16String(bs, bb, v)
 		return matchExactPrefix(s, prefix)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint32ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) {
+func matchUint32ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) error {
 	if !matchMinMaxExactPrefix(ch, bm, prefix, tokens) {
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint32String(bs, bb, v)
 		return matchExactPrefix(s, prefix)
 	})
-	bbPool.Put(bb)
 }
 
-func matchUint64ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) {
+func matchUint64ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) error {
 	if !matchMinMaxExactPrefix(ch, bm, prefix, tokens) {
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toUint64String(bs, bb, v)
 		return matchExactPrefix(s, prefix)
 	})
-	bbPool.Put(bb)
 }
 
-func matchInt64ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) {
+func matchInt64ByExactPrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) error {
 	if prefix == "" {
 		// An empty prefix matches all the values
-		return
+		return nil
 	}
 	if len(tokens) > 0 {
 		// Non-empty tokens means that the prefix contains at least two tokens.
 		// Multiple tokens cannot match any uint value.
 		bm.resetBits()
-		return
+		return nil
 	}
 	if prefix != "-" {
 		n, ok := tryParseInt64(prefix)
 		if !ok || n > int64(ch.maxValue) || n < int64(ch.minValue) {
 			bm.resetBits()
-			return
+			return nil
 		}
 	}
 
 	bb := bbPool.Get()
-	visitValues(bs, ch, bm, func(v string) bool {
+	defer bbPool.Put(bb)
+	return visitValues(bs, ch, bm, func(v string) bool {
 		s := toInt64String(bs, bb, v)
 		return matchExactPrefix(s, prefix)
 	})
-	bbPool.Put(bb)
 }
 
 func matchMinMaxExactPrefix(ch *columnHeader, bm *bitmap, prefix string, tokens []uint64) bool {

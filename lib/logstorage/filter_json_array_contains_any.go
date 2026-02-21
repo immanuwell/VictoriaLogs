@@ -69,7 +69,7 @@ func (fa *filterJSONArrayContainsAny) matchRowByField(fields []Field, fieldName 
 	return matchJSONArrayContainsAny(v, fa.values, tokenss)
 }
 
-func (fa *filterJSONArrayContainsAny) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fa *filterJSONArrayContainsAny) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	tokenss := fa.getTokenss()
 
 	c := br.getColumnByName(fieldName)
@@ -78,22 +78,26 @@ func (fa *filterJSONArrayContainsAny) applyToBlockResultByField(br *blockResult,
 		if !matchJSONArrayContainsAny(v, fa.values, tokenss) {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 	if c.isTime {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := values[idx]
 			return matchJSONArrayContainsAny(v, fa.values, tokenss)
 		})
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range c.dictValues {
 			c := byte(0)
 			if matchJSONArrayContainsAny(v, fa.values, tokenss) {
@@ -101,48 +105,59 @@ func (fa *filterJSONArrayContainsAny) applyToBlockResultByField(br *blockResult,
 			}
 			bb.B = append(bb.B, c)
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			n := valuesEncoded[idx][0]
 			return bb.B[n] == 1
 		})
-		bbPool.Put(bb)
 	default:
 		bm.resetBits()
 	}
+	return nil
 }
 
-func (fa *filterJSONArrayContainsAny) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fa *filterJSONArrayContainsAny) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	tokenss := fa.getTokenss()
 
-	v := bs.getConstColumnValue(fieldName)
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil {
+		return err
+	}
 	if v != "" {
 		if !matchJSONArrayContainsAny(v, fa.values, tokenss) {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 
 	// Verify whether filter matches other columns
-	ch := bs.getColumnHeader(fieldName)
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil {
+		return err
+	}
 	if ch == nil {
 		// Fast path - there are no matching columns.
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	switch ch.valueType {
 	case valueTypeString:
 		tokensHashess := fa.getTokensHashes()
-		if !matchAnyTokensHashess(bs, ch, tokensHashess) {
+		matches, err := matchAnyTokensHashess(bs, ch, tokensHashess)
+		if !matches || err != nil {
 			bm.resetBits()
-			return
+			return err
 		}
-		visitValues(bs, ch, bm, func(v string) bool {
+		return visitValues(bs, ch, bm, func(v string) bool {
 			return matchJSONArrayContainsAny(v, fa.values, tokenss)
 		})
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range ch.valuesDict.values {
 			c := byte(0)
 			if matchJSONArrayContainsAny(v, fa.values, tokenss) {
@@ -150,20 +165,24 @@ func (fa *filterJSONArrayContainsAny) applyToBlockSearchByField(bs *blockSearch,
 			}
 			bb.B = append(bb.B, c)
 		}
-		matchEncodedValuesDict(bs, ch, bm, bb.B)
-		bbPool.Put(bb)
+		return matchEncodedValuesDict(bs, ch, bm, bb.B)
 	default:
 		bm.resetBits()
 	}
+	return nil
 }
 
-func matchAnyTokensHashess(bs *blockSearch, ch *columnHeader, tokensHashess [][]uint64) bool {
+func matchAnyTokensHashess(bs *blockSearch, ch *columnHeader, tokensHashess [][]uint64) (bool, error) {
 	for _, tokensHashes := range tokensHashess {
-		if matchBloomFilterAllTokens(bs, ch, tokensHashes) {
-			return true
+		matches, err := matchBloomFilterAllTokens(bs, ch, tokensHashes)
+		if err != nil {
+			return false, err
+		}
+		if matches {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func matchJSONArrayContainsAny(s string, values []string, tokenss [][]string) bool {

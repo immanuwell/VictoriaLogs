@@ -88,63 +88,65 @@ func (fp *filterAnyCasePrefix) matchRowByField(fields []Field, fieldName string)
 	return matchAnyCasePrefix(v, prefixLowercase)
 }
 
-func (fp *filterAnyCasePrefix) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fp *filterAnyCasePrefix) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	prefixLowercase := fp.getPrefixLowercase()
-	applyToBlockResultGeneric(br, bm, fieldName, prefixLowercase, matchAnyCasePrefix)
+	return applyToBlockResultGeneric(br, bm, fieldName, prefixLowercase, matchAnyCasePrefix)
 }
 
-func (fp *filterAnyCasePrefix) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fp *filterAnyCasePrefix) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	prefixLowercase := fp.getPrefixLowercase()
 
 	// Verify whether fp matches const column
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if !matchAnyCasePrefix(v, prefixLowercase) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether fp matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		// Fast path - there are no matching columns.
 		bm.resetBits()
-		return
+		return err
 	}
 
 	tokens := fp.getTokensHashes()
 
 	switch ch.valueType {
 	case valueTypeString:
-		matchStringByAnyCasePrefix(bs, ch, bm, prefixLowercase)
+		return matchStringByAnyCasePrefix(bs, ch, bm, prefixLowercase)
 	case valueTypeDict:
-		matchValuesDictByAnyCasePrefix(bs, ch, bm, prefixLowercase)
+		return matchValuesDictByAnyCasePrefix(bs, ch, bm, prefixLowercase)
 	case valueTypeUint8:
-		matchUint8ByPrefix(bs, ch, bm, prefixLowercase, tokens)
+		return matchUint8ByPrefix(bs, ch, bm, prefixLowercase, tokens)
 	case valueTypeUint16:
-		matchUint16ByPrefix(bs, ch, bm, prefixLowercase, tokens)
+		return matchUint16ByPrefix(bs, ch, bm, prefixLowercase, tokens)
 	case valueTypeUint32:
-		matchUint32ByPrefix(bs, ch, bm, prefixLowercase, tokens)
+		return matchUint32ByPrefix(bs, ch, bm, prefixLowercase, tokens)
 	case valueTypeUint64:
-		matchUint64ByPrefix(bs, ch, bm, prefixLowercase, tokens)
+		return matchUint64ByPrefix(bs, ch, bm, prefixLowercase, tokens)
 	case valueTypeInt64:
-		matchInt64ByPrefix(bs, ch, bm, prefixLowercase, tokens)
+		return matchInt64ByPrefix(bs, ch, bm, prefixLowercase, tokens)
 	case valueTypeFloat64:
-		matchFloat64ByPrefix(bs, ch, bm, prefixLowercase, tokens)
+		return matchFloat64ByPrefix(bs, ch, bm, prefixLowercase, tokens)
 	case valueTypeIPv4:
-		matchIPv4ByPrefix(bs, ch, bm, prefixLowercase, tokens)
+		return matchIPv4ByPrefix(bs, ch, bm, prefixLowercase, tokens)
 	case valueTypeTimestampISO8601:
 		prefixUppercase := fp.getPrefixUppercase()
 		tokensUppercase := fp.getTokensUppercaseHashes()
-		matchTimestampISO8601ByPrefix(bs, ch, bm, prefixUppercase, tokensUppercase)
+		return matchTimestampISO8601ByPrefix(bs, ch, bm, prefixUppercase, tokensUppercase)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
-func matchValuesDictByAnyCasePrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefixLowercase string) {
+func matchValuesDictByAnyCasePrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefixLowercase string) error {
 	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 	for _, v := range ch.valuesDict.values {
 		c := byte(0)
 		if matchAnyCasePrefix(v, prefixLowercase) {
@@ -152,12 +154,11 @@ func matchValuesDictByAnyCasePrefix(bs *blockSearch, ch *columnHeader, bm *bitma
 		}
 		bb.B = append(bb.B, c)
 	}
-	matchEncodedValuesDict(bs, ch, bm, bb.B)
-	bbPool.Put(bb)
+	return matchEncodedValuesDict(bs, ch, bm, bb.B)
 }
 
-func matchStringByAnyCasePrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefixLowercase string) {
-	visitValues(bs, ch, bm, func(v string) bool {
+func matchStringByAnyCasePrefix(bs *blockSearch, ch *columnHeader, bm *bitmap, prefixLowercase string) error {
+	return visitValues(bs, ch, bm, func(v string) bool {
 		return matchAnyCasePrefix(v, prefixLowercase)
 	})
 }

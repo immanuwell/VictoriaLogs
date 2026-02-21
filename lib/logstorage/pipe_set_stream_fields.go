@@ -76,10 +76,11 @@ func (ps *pipeSetStreamFields) visitSubqueries(visitFunc func(q *Query)) {
 	ps.iff.visitSubqueries(visitFunc)
 }
 
-func (ps *pipeSetStreamFields) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (ps *pipeSetStreamFields) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeSetStreamFieldsProcessor{
 		ps:     ps,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -88,6 +89,7 @@ type pipeSetStreamFieldsProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeSetStreamFieldsProcessorShard]
+	cancel func(error)
 }
 
 type pipeSetStreamFieldsProcessorShard struct {
@@ -109,7 +111,10 @@ func (psp *pipeSetStreamFieldsProcessor) writeBlock(workerID uint, br *blockResu
 	if iff := ps.iff; iff != nil {
 		bm.init(br.rowsLen)
 		bm.setBits()
-		iff.f.applyToBlockResult(br, bm)
+		if err := iff.f.applyToBlockResult(br, bm); err != nil {
+			psp.cancel(err)
+			return
+		}
 		if bm.isZero() {
 			psp.ppNext.writeBlock(workerID, br)
 			return
@@ -125,10 +130,24 @@ func (psp *pipeSetStreamFieldsProcessor) writeBlock(workerID uint, br *blockResu
 		stream := ""
 		streamID := ""
 		if ps.iff == nil || bm.isSetBit(rowIdx) {
-			stream = shard.setLogStreamFields(ps, br, rowIdx)
+			var err error
+			stream, err = shard.setLogStreamFields(ps, br, rowIdx)
+			if err != nil {
+				psp.cancel(err)
+				return
+			}
 		} else {
-			stream = streamColumn.getValueAtRow(br, rowIdx)
-			streamID = streamIDColumn.getValueAtRow(br, rowIdx)
+			var err error
+			stream, err = streamColumn.getValueAtRow(br, rowIdx)
+			if err != nil {
+				psp.cancel(err)
+				return
+			}
+			streamID, err = streamIDColumn.getValueAtRow(br, rowIdx)
+			if err != nil {
+				psp.cancel(err)
+				return
+			}
 		}
 		shard.rcs[0].addValue(stream)
 		shard.rcs[1].addValue(streamID)
@@ -136,6 +155,7 @@ func (psp *pipeSetStreamFieldsProcessor) writeBlock(workerID uint, br *blockResu
 
 	br.addResultColumn(shard.rcs[0])
 	br.addResultColumn(shard.rcs[1])
+
 	psp.ppNext.writeBlock(workerID, br)
 
 	shard.a.reset()
@@ -143,12 +163,11 @@ func (psp *pipeSetStreamFieldsProcessor) writeBlock(workerID uint, br *blockResu
 	shard.rcs[1].reset()
 }
 
-func (psp *pipeSetStreamFieldsProcessor) flush() error {
-	return nil
-}
+func (psp *pipeSetStreamFieldsProcessor) flush() {}
 
-func (shard *pipeSetStreamFieldsProcessorShard) setLogStreamFields(ps *pipeSetStreamFields, br *blockResult, rowIdx int) string {
+func (shard *pipeSetStreamFieldsProcessorShard) setLogStreamFields(ps *pipeSetStreamFields, br *blockResult, rowIdx int) (string, error) {
 	st := GetStreamTags()
+	defer PutStreamTags(st)
 
 	cs := br.getColumns()
 	for _, c := range cs {
@@ -156,17 +175,17 @@ func (shard *pipeSetStreamFieldsProcessorShard) setLogStreamFields(ps *pipeSetSt
 			continue
 		}
 
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return "", nil
+		}
 		st.Add(c.name, v)
 	}
 
 	bLen := len(shard.a.b)
 	sort.Sort(st)
 	shard.a.b = st.marshalString(shard.a.b)
-
-	PutStreamTags(st)
-
-	return bytesutil.ToUnsafeString(shard.a.b[bLen:])
+	return bytesutil.ToUnsafeString(shard.a.b[bLen:]), nil
 }
 
 func parsePipeSetStreamFields(lex *lexer) (pipe, error) {

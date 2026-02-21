@@ -2,6 +2,7 @@ package logstorage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -28,6 +29,9 @@ type QueryContext struct {
 	// Context is the context for executing the Query.
 	Context context.Context
 
+	// cancel allows to cancel query context immediately
+	cancel context.CancelCauseFunc
+
 	// QueryStats is query stats, which is updated after Query execution.
 	QueryStats *QueryStats
 
@@ -53,24 +57,24 @@ type QueryContext struct {
 }
 
 // NewQueryContext returns new context for the given query.
-func NewQueryContext(ctx context.Context, qs *QueryStats, tenantIDs []TenantID, q *Query, allowPartialResponse bool, hiddenFieldsFilters []string) *QueryContext {
+func NewQueryContext(ctx context.Context, cancel func(error), qs *QueryStats, tenantIDs []TenantID, q *Query, allowPartialResponse bool, hiddenFieldsFilters []string) *QueryContext {
 	startTime := time.Now()
-	return newQueryContext(ctx, qs, tenantIDs, q, allowPartialResponse, hiddenFieldsFilters, startTime)
+	return newQueryContext(ctx, cancel, qs, tenantIDs, q, allowPartialResponse, hiddenFieldsFilters, startTime)
 }
 
 // WithQuery returns new QueryContext with the given q, while preserving other fields from qctx.
 func (qctx *QueryContext) WithQuery(q *Query) *QueryContext {
-	return newQueryContext(qctx.Context, qctx.QueryStats, qctx.TenantIDs, q, qctx.AllowPartialResponse, qctx.HiddenFieldsFilters, qctx.startTime)
+	return newQueryContext(qctx.Context, qctx.cancel, qctx.QueryStats, qctx.TenantIDs, q, qctx.AllowPartialResponse, qctx.HiddenFieldsFilters, qctx.startTime)
 }
 
 // WithContext returns new QueryContext with the given ctx, while preserving other fields from qctx.
 func (qctx *QueryContext) WithContext(ctx context.Context) *QueryContext {
-	return newQueryContext(ctx, qctx.QueryStats, qctx.TenantIDs, qctx.Query, qctx.AllowPartialResponse, qctx.HiddenFieldsFilters, qctx.startTime)
+	return newQueryContext(ctx, qctx.cancel, qctx.QueryStats, qctx.TenantIDs, qctx.Query, qctx.AllowPartialResponse, qctx.HiddenFieldsFilters, qctx.startTime)
 }
 
 // WithContextAndQuery returns new QueryContext with the given ctx and q, while preserving other fields from qctx.
 func (qctx *QueryContext) WithContextAndQuery(ctx context.Context, q *Query) *QueryContext {
-	return newQueryContext(ctx, qctx.QueryStats, qctx.TenantIDs, q, qctx.AllowPartialResponse, qctx.HiddenFieldsFilters, qctx.startTime)
+	return newQueryContext(ctx, qctx.cancel, qctx.QueryStats, qctx.TenantIDs, q, qctx.AllowPartialResponse, qctx.HiddenFieldsFilters, qctx.startTime)
 }
 
 // QueryDurationNsecs returns the duration in nanoseconds since the NewQueryContext call.
@@ -78,7 +82,7 @@ func (qctx *QueryContext) QueryDurationNsecs() int64 {
 	return time.Since(qctx.startTime).Nanoseconds()
 }
 
-func newQueryContext(ctx context.Context, qs *QueryStats, tenantIDs []TenantID, q *Query, allowPartialResponse bool, hiddenFieldsFilters []string, startTime time.Time) *QueryContext {
+func newQueryContext(ctx context.Context, cancel func(error), qs *QueryStats, tenantIDs []TenantID, q *Query, allowPartialResponse bool, hiddenFieldsFilters []string, startTime time.Time) *QueryContext {
 	if q.opts.allowPartialResponse != nil {
 		// query options override other settings for allowPartialResponse.
 		allowPartialResponse = *q.opts.allowPartialResponse
@@ -94,6 +98,7 @@ func newQueryContext(ctx context.Context, qs *QueryStats, tenantIDs []TenantID, 
 		HiddenFieldsFilters:  hiddenFieldsFilters,
 
 		startTime: startTime,
+		cancel:    cancel,
 	}
 }
 
@@ -178,14 +183,17 @@ func (pso *partitionSearchOptions) matchTimeRange(minTimestamp, maxTimestamp int
 // If you need BlockColumn names or values after the function returns, copy them using strings.Clone.
 type WriteDataBlockFunc func(workerID uint, db *DataBlock)
 
-func (f WriteDataBlockFunc) newBlockResultWriter() writeBlockResultFunc {
+func (f WriteDataBlockFunc) newBlockResultWriter(qctx *QueryContext) writeBlockResultFunc {
 	var dbs atomicutil.Slice[DataBlock]
 	return func(workerID uint, br *blockResult) {
 		if br.rowsLen == 0 {
 			return
 		}
 		db := dbs.Get(workerID)
-		db.mustInitFromBlockResult(br)
+		if err := db.initFromBlockResult(br); err != nil {
+			qctx.cancel(err)
+			return
+		}
 		f(workerID, db)
 	}
 }
@@ -209,7 +217,7 @@ func (f writeBlockResultFunc) newDataBlockWriter() WriteDataBlockFunc {
 
 // RunQuery runs the given qctx and calls writeBlock for results.
 func (s *Storage) RunQuery(qctx *QueryContext, writeBlock WriteDataBlockFunc) error {
-	writeBlockResult := writeBlock.newBlockResultWriter()
+	writeBlockResult := writeBlock.newBlockResultWriter(qctx)
 	return s.runQuery(qctx, writeBlockResult)
 }
 
@@ -227,7 +235,7 @@ func (s *Storage) runQuery(qctx *QueryContext, writeBlock writeBlockResultFunc) 
 
 	search := func(stopCh <-chan struct{}, writeBlockToPipes writeBlockResultFunc) error {
 		workersCount := q.GetParallelReaders(s.defaultParallelReaders)
-		s.searchParallel(workersCount, sso, qctx.QueryStats, stopCh, writeBlockToPipes)
+		s.searchParallel(workersCount, qctx, sso, stopCh, writeBlockToPipes)
 		return nil
 	}
 
@@ -271,9 +279,7 @@ func (s *Storage) getSearchOptions(tenantIDs []TenantID, q *Query, hiddenFieldsF
 type searchFunc func(stopCh <-chan struct{}, writeBlock writeBlockResultFunc) error
 
 func runPipes(qctx *QueryContext, pipes []pipe, search searchFunc, writeBlock writeBlockResultFunc, concurrency int) error {
-	ctx, topCancel := context.WithCancel(qctx.Context)
-	defer topCancel()
-
+	ctx := qctx.Context
 	stopCh := ctx.Done()
 	if len(pipes) == 0 {
 		// Fast path when there are no pipes
@@ -281,28 +287,33 @@ func runPipes(qctx *QueryContext, pipes []pipe, search searchFunc, writeBlock wr
 	}
 
 	pp := newNoopPipeProcessor(stopCh, writeBlock)
-	cancels := make([]func(), len(pipes))
+	cancels := make([]context.CancelCauseFunc, len(pipes))
 	pps := make([]pipeProcessor, len(pipes))
 
 	for i := len(pipes) - 1; i >= 0; i-- {
 		p := pipes[i]
 		ctxChild, cancel := context.WithCancel(ctx)
-		pp = p.newPipeProcessor(concurrency, stopCh, cancel, pp)
+		childCancel := func(err error) {
+			if err != nil {
+				qctx.cancel(err)
+			} else {
+				cancel()
+			}
+		}
+		pp = p.newPipeProcessor(concurrency, stopCh, childCancel, pp)
 
-		cancels[i] = cancel
+		cancels[i] = childCancel
 		pps[i] = pp
 
 		stopCh = ctxChild.Done()
 		ctx = ctxChild
 	}
 
-	errSearch := search(stopCh, pp.writeBlock)
-	if errSearch != nil {
+	if err := search(stopCh, pp.writeBlock); err != nil {
 		// Cancel the whole query in order to free up resources occupied by pipes.
-		topCancel()
+		qctx.cancel(err)
 	}
 
-	var errFlush error
 	for i, pp := range pps {
 		switch t := pp.(type) {
 		case *pipeQueryStatsProcessor:
@@ -311,21 +322,14 @@ func runPipes(qctx *QueryContext, pipes []pipe, search searchFunc, writeBlock wr
 			t.setQueryStats(qctx.QueryStats, qctx.QueryDurationNsecs())
 		}
 
-		if err := pp.flush(); err != nil && errFlush == nil {
-			// Cancel the whole query in order to free up resources occupied by the remaining pipes.
-			topCancel()
-
-			errFlush = err
-		}
+		pp.flush()
 		cancel := cancels[i]
-		cancel()
+		cancel(nil)
 	}
-
-	if errSearch != nil {
-		return errSearch
+	if err := context.Cause(qctx.Context); err != nil && !errors.Is(err, context.Canceled) {
+		return err
 	}
-
-	return errFlush
+	return nil
 }
 
 // GetFieldNames returns field names for the given qctx.
@@ -402,7 +406,11 @@ func getRows(qctx *QueryContext, runQuery runQueryFunc) ([][]Field, error) {
 
 			for j := range cs {
 				name := columnNames[j]
-				v := cs[j].getValueAtRow(br, rowIdx)
+				v, err := cs[j].getValueAtRow(br, rowIdx)
+				if err != nil {
+					qctx.cancel(err)
+					return
+				}
 				if v == "" {
 					continue
 				}
@@ -481,7 +489,11 @@ func getFieldValuesGeneric(qctx *QueryContext, runQuery runQueryFunc, fieldName 
 			logger.Panicf("BUG: expecting one column; got %d columns", len(cs))
 		}
 
-		columnValues := cs[0].getValues(br)
+		columnValues, err := cs[0].getValues(br)
+		if err != nil {
+			qctx.cancel(err)
+			return
+		}
 
 		valuesDst := valuesPerCPU[workerID]
 		a := allocatorsPerCPU[workerID]
@@ -723,7 +735,7 @@ func (s *Storage) getTenantIDs(ctx context.Context, start, end int64) ([]TenantI
 	ptws = append([]*partitionWrapper{}, ptws...)
 
 	for _, ptw := range ptws {
-		ptw.incRef()
+		ptw.incReadRef()
 	}
 	s.partitionsLock.Unlock()
 
@@ -738,7 +750,7 @@ func (s *Storage) getTenantIDs(ctx context.Context, start, end int64) ([]TenantI
 
 	// Decrement references to partitions
 	for _, ptw := range ptws {
-		ptw.decRef()
+		ptw.decReadRef()
 	}
 
 	uniqTenantIDs := make(map[TenantID]struct{})
@@ -769,8 +781,17 @@ func (s *Storage) runValuesWithHitsQuery(qctx *QueryContext) ([]ValueWithHits, e
 			logger.Panicf("BUG: expecting two columns; got %d columns", len(cs))
 		}
 
-		columnValues := cs[0].getValues(br)
-		columnHits := cs[1].getValues(br)
+		columnValues, err := cs[0].getValues(br)
+		if err != nil {
+			qctx.cancel(err)
+			return
+		}
+
+		columnHits, err := cs[1].getValues(br)
+		if err != nil {
+			qctx.cancel(err)
+			return
+		}
 
 		valuesWithHits := make([]ValueWithHits, len(columnValues))
 		for i := range columnValues {
@@ -785,10 +806,10 @@ func (s *Storage) runValuesWithHitsQuery(qctx *QueryContext) ([]ValueWithHits, e
 		resultsLock.Unlock()
 	}
 
-	err := s.runQuery(qctx, writeBlockResult)
-	if err != nil {
+	if err := s.runQuery(qctx, writeBlockResult); err != nil {
 		return nil, err
 	}
+
 	sortValuesWithHits(results)
 
 	return results, nil
@@ -1289,45 +1310,86 @@ func (db *DataBlock) UnmarshalInplace(src []byte, valuesBuf []string) ([]byte, [
 	return src, valuesBuf, nil
 }
 
-func (db *DataBlock) mustInitFromBlockResult(br *blockResult) {
+func (db *DataBlock) initFromBlockResult(br *blockResult) error {
 	db.Reset()
 
 	cs := br.getColumns()
 	for _, c := range cs {
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return err
+		}
 		db.columns = append(db.columns, BlockColumn{
 			Name:   c.name,
 			Values: values,
 		})
 	}
+	return nil
 }
 
 // search searches for the matching rows according to sso.
 //
 // It uses workersCount parallel workers for the search and calls writeBlock for each matching block.
-func (s *Storage) searchParallel(workersCount int, sso *storageSearchOptions, qs *QueryStats, stopCh <-chan struct{}, writeBlock writeBlockResultFunc) {
-	// spin up workers
-	var wg sync.WaitGroup
+func (s *Storage) searchParallel(workersCount int, qctx *QueryContext, sso *storageSearchOptions, stopCh <-chan struct{}, writeBlock writeBlockResultFunc) {
+	var preloadCh chan *blockSearchWorkBatch
 	workCh := make(chan *blockSearchWorkBatch, workersCount)
+
+	ptws, hasRemotePartitions, ptwsDecRef := s.getPartitionsForTimeRange(sso.minTimestamp, sso.maxTimestamp)
+	defer ptwsDecRef()
+
+	var preloadWg sync.WaitGroup
+	if hasRemotePartitions {
+		preloadCh = make(chan *blockSearchWorkBatch, workersCount)
+		neededBloomCols := collectBloomFilterColumns(sso.filter)
+		preloadWorkersCount := 4 * workersCount
+		for range preloadWorkersCount {
+			preloadWg.Go(func() {
+				for bswb := range preloadCh {
+					if !needStop(stopCh) {
+						preloadBatchBloomFilters(bswb.bsws, neededBloomCols)
+					}
+					select {
+					case workCh <- bswb:
+					case <-stopCh:
+						bswb.bsws = bswb.bsws[:0]
+						putBlockSearchWorkBatch(bswb)
+					}
+				}
+			})
+		}
+	} else {
+		preloadCh = workCh
+	}
+
+	var wg sync.WaitGroup
 	for workerID := range workersCount {
 		wg.Go(func() {
 			qsLocal := &QueryStats{}
 			bs := getBlockSearch()
 			bm := getBitmap(0)
 
+			defer func() {
+				putBlockSearch(bs)
+				putBitmap(bm)
+			}()
+
 			for bswb := range workCh {
 				bsws := bswb.bsws
 				for i := range bsws {
 					bsw := &bsws[i]
 					if needStop(stopCh) {
-						// The search has been canceled. Just skip all the scheduled work in order to save CPU time.
 						bsw.reset()
 						continue
 					}
 
 					rowsProcessed := bsw.bh.rowsCount
+					if err := bs.search(qsLocal, bsw, bm); err != nil {
+						qctx.cancel(err)
+						bswb.bsws = bswb.bsws[:0]
+						putBlockSearchWorkBatch(bswb)
+						return
+					}
 
-					bs.search(qsLocal, bsw, bm)
 					if bs.br.rowsLen > 0 {
 						if sso.timeOffset != 0 {
 							bs.subTimeOffsetToTimestamps(sso.timeOffset)
@@ -1344,16 +1406,10 @@ func (s *Storage) searchParallel(workersCount int, sso *storageSearchOptions, qs
 				putBlockSearchWorkBatch(bswb)
 			}
 
-			putBlockSearch(bs)
-			putBitmap(bm)
-			qs.UpdateAtomic(qsLocal)
+			qctx.QueryStats.UpdateAtomic(qsLocal)
 
 		})
 	}
-
-	// Select partitions according to the selected time range
-	ptws, ptwsDecRef := s.getPartitionsForTimeRange(sso.minTimestamp, sso.maxTimestamp)
-	defer ptwsDecRef()
 
 	// Schedule concurrent search across matching partitions.
 	psfs := make([]partitionSearchFinalizer, len(ptws))
@@ -1361,19 +1417,31 @@ func (s *Storage) searchParallel(workersCount int, sso *storageSearchOptions, qs
 	for idx, ptw := range ptws {
 		partitionSearchConcurrencyLimitCh <- struct{}{}
 		wgSearchers.Go(func() {
+			defer func() {
+				<-partitionSearchConcurrencyLimitCh
+			}()
+
 			qsLocal := &QueryStats{}
 
-			psfs[idx] = ptw.pt.search(sso, qsLocal, workCh, stopCh)
+			var err error
+			psfs[idx], err = ptw.pt.search(sso, qsLocal, preloadCh, stopCh)
+			if err != nil {
+				qctx.cancel(err)
+				return
+			}
 
-			qs.UpdateAtomic(qsLocal)
-
-			<-partitionSearchConcurrencyLimitCh
+			qctx.QueryStats.UpdateAtomic(qsLocal)
 		})
 	}
-	wgSearchers.Wait()
 
-	// Wait until workers finish their work
+	wgSearchers.Wait()
+	if hasRemotePartitions {
+		close(preloadCh)
+	}
+
+	preloadWg.Wait()
 	close(workCh)
+
 	wg.Wait()
 
 	// Finalize partition search
@@ -1382,10 +1450,11 @@ func (s *Storage) searchParallel(workersCount int, sso *storageSearchOptions, qs
 	}
 }
 
-// getPartitionsForTimeRange returns partitions covered by [minTimestamp, maxTimestamp] time range.
+// getPartitionsForTimeRange returns partitions covered by [minTimestamp, maxTimestamp] time range
+// and whether any of them are remote.
 //
 // The caller must call ptwsDecRef when the returned partitions are no longer needed.
-func (s *Storage) getPartitionsForTimeRange(minTimestamp, maxTimestamp int64) (ptws []*partitionWrapper, ptwsDecRef func()) {
+func (s *Storage) getPartitionsForTimeRange(minTimestamp, maxTimestamp int64) (ptws []*partitionWrapper, hasRemote bool, ptwsDecRef func()) {
 	s.partitionsLock.Lock()
 
 	// s.partitions are sorted by s.day. Use binary search for finding partitions for the given [minTimestamp, maxTimestamp] time range.
@@ -1405,18 +1474,21 @@ func (s *Storage) getPartitionsForTimeRange(minTimestamp, maxTimestamp int64) (p
 	ptws = append([]*partitionWrapper{}, ptwsTmp...)
 
 	for _, ptw := range ptws {
-		ptw.incRef()
+		ptw.incReadRef()
+		if ptw.pt.isRemote {
+			hasRemote = true
+		}
 	}
 
 	s.partitionsLock.Unlock()
 
 	ptwsDecRef = func() {
 		for _, ptw := range ptws {
-			ptw.decRef()
+			ptw.decReadRef()
 		}
 	}
 
-	return ptws, ptwsDecRef
+	return ptws, hasRemote, ptwsDecRef
 }
 
 // partitionSearchConcurrencyLimitCh limits the number of concurrent searches in partition.
@@ -1426,10 +1498,10 @@ var partitionSearchConcurrencyLimitCh = make(chan struct{}, cgroup.AvailableCPUs
 
 type partitionSearchFinalizer func()
 
-func (pt *partition) search(sso *storageSearchOptions, qs *QueryStats, workCh chan<- *blockSearchWorkBatch, stopCh <-chan struct{}) partitionSearchFinalizer {
+func (pt *partition) search(sso *storageSearchOptions, qs *QueryStats, workCh chan<- *blockSearchWorkBatch, stopCh <-chan struct{}) (partitionSearchFinalizer, error) {
 	if needStop(stopCh) {
 		// Do not spend CPU time on search, since it is already stopped.
-		return func() {}
+		return func() {}, nil
 	}
 
 	pso := pt.getSearchOptions(sso)
@@ -1523,16 +1595,18 @@ func initStreamFilters(tenantIDs []TenantID, idb *indexdb, f filter) filter {
 	return f
 }
 
-func (ddb *datadb) search(pso *partitionSearchOptions, qs *QueryStats, workCh chan<- *blockSearchWorkBatch, stopCh <-chan struct{}) partitionSearchFinalizer {
+func (ddb *datadb) search(pso *partitionSearchOptions, qs *QueryStats, workCh chan<- *blockSearchWorkBatch, stopCh <-chan struct{}) (partitionSearchFinalizer, error) {
 	// Select parts with data for the given time range
 	pws, pwsDecRef := ddb.getPartsForTimeRange(pso.minTimestamp, pso.maxTimestamp)
 
 	// Apply search to matching parts
 	for _, pw := range pws {
-		pw.p.search(pso, qs, workCh, stopCh)
+		if err := pw.p.search(pso, qs, workCh, stopCh); err != nil {
+			return pwsDecRef, err
+		}
 	}
 
-	return pwsDecRef
+	return pwsDecRef, nil
 }
 
 // getPartsForTimeRange returns ddb parts for the given time range.
@@ -1558,17 +1632,17 @@ func (ddb *datadb) getPartsForTimeRange(minTimestamp, maxTimestamp int64) (pws [
 	return pws, pwsDecRef
 }
 
-func (p *part) search(pso *partitionSearchOptions, qs *QueryStats, workCh chan<- *blockSearchWorkBatch, stopCh <-chan struct{}) {
+func (p *part) search(pso *partitionSearchOptions, qs *QueryStats, workCh chan<- *blockSearchWorkBatch, stopCh <-chan struct{}) error {
 	bhss := getBlockHeaders()
+	defer putBlockHeaders(bhss)
 	if len(pso.tenantIDs) > 0 {
-		p.searchByTenantIDs(pso, qs, bhss, workCh, stopCh)
+		return p.searchByTenantIDs(pso, qs, bhss, workCh, stopCh)
 	} else {
-		p.searchByStreamIDs(pso, qs, bhss, workCh, stopCh)
+		return p.searchByStreamIDs(pso, qs, bhss, workCh, stopCh)
 	}
-	putBlockHeaders(bhss)
 }
 
-func (p *part) hasMatchingRows(pso *partitionSearchOptions, stopCh <-chan struct{}) bool {
+func (p *part) hasMatchingRows(pso *partitionSearchOptions, cancel context.CancelCauseFunc, stopCh <-chan struct{}) bool {
 	var hasMatch atomic.Bool
 
 	// spin up workers
@@ -1581,13 +1655,23 @@ func (p *part) hasMatchingRows(pso *partitionSearchOptions, stopCh <-chan struct
 			bs := getBlockSearch()
 			bm := getBitmap(0)
 
+			defer func() {
+				putBlockSearch(bs)
+				putBitmap(bm)
+			}()
+
 			for bswb := range workCh {
 				bsws := bswb.bsws
 				for i := range bsws {
 					bsw := &bsws[i]
 
 					if !hasMatch.Load() && !needStop(stopCh) {
-						bs.search(qsLocal, bsw, bm)
+						if err := bs.search(qsLocal, bsw, bm); err != nil {
+							cancel(err)
+							bswb.bsws = bswb.bsws[:0]
+							putBlockSearchWorkBatch(bswb)
+							return
+						}
 						if bs.br.rowsLen > 0 {
 							hasMatch.Store(true)
 						}
@@ -1598,20 +1682,21 @@ func (p *part) hasMatchingRows(pso *partitionSearchOptions, stopCh <-chan struct
 				bswb.bsws = bswb.bsws[:0]
 				putBlockSearchWorkBatch(bswb)
 			}
-
-			putBlockSearch(bs)
-			putBitmap(bm)
-
 		})
 	}
 
 	// execute the search
 	var qs QueryStats
-	p.search(pso, &qs, workCh, stopCh)
+	err := p.search(pso, &qs, workCh, stopCh)
 
 	// Wait until workers finish their work
 	close(workCh)
 	wg.Wait()
+
+	if err != nil {
+		cancel(err)
+		return false
+	}
 
 	return hasMatch.Load()
 }
@@ -1643,7 +1728,7 @@ func (bhss *blockHeaders) reset() {
 	bhss.bhs = bhs[:0]
 }
 
-func (p *part) searchByTenantIDs(pso *partitionSearchOptions, qs *QueryStats, bhss *blockHeaders, workCh chan<- *blockSearchWorkBatch, stopCh <-chan struct{}) {
+func (p *part) searchByTenantIDs(pso *partitionSearchOptions, qs *QueryStats, bhss *blockHeaders, workCh chan<- *blockSearchWorkBatch, stopCh <-chan struct{}) error {
 	// it is assumed that tenantIDs are sorted
 	tenantIDs := pso.tenantIDs
 
@@ -1665,7 +1750,7 @@ func (p *part) searchByTenantIDs(pso *partitionSearchOptions, qs *QueryStats, bh
 	ibhs := p.indexBlockHeaders
 	for len(ibhs) > 0 && len(tenantIDs) > 0 {
 		if needStop(stopCh) {
-			return
+			return nil
 		}
 
 		// locate tenantID equal or bigger than the tenantID in ibhs[0]
@@ -1700,7 +1785,11 @@ func (p *part) searchByTenantIDs(pso *partitionSearchOptions, qs *QueryStats, bh
 			continue
 		}
 
-		bhss.bhs = ibh.mustReadBlockHeaders(bhss.bhs[:0], p, qs)
+		var err error
+		bhss.bhs, err = ibh.mustReadBlockHeaders(bhss.bhs[:0], p, qs)
+		if err != nil {
+			return err
+		}
 
 		bhs := bhss.bhs
 		for len(bhs) > 0 {
@@ -1717,7 +1806,7 @@ func (p *part) searchByTenantIDs(pso *partitionSearchOptions, qs *QueryStats, bh
 					continue
 				}
 				if !scheduleBlockSearch(bh) {
-					return
+					return nil
 				}
 			}
 			if len(bhs) == 0 {
@@ -1743,9 +1832,10 @@ func (p *part) searchByTenantIDs(pso *partitionSearchOptions, qs *QueryStats, bh
 	case <-stopCh:
 	case workCh <- bswb:
 	}
+	return nil
 }
 
-func (p *part) searchByStreamIDs(pso *partitionSearchOptions, qs *QueryStats, bhss *blockHeaders, workCh chan<- *blockSearchWorkBatch, stopCh <-chan struct{}) {
+func (p *part) searchByStreamIDs(pso *partitionSearchOptions, qs *QueryStats, bhss *blockHeaders, workCh chan<- *blockSearchWorkBatch, stopCh <-chan struct{}) error {
 	// it is assumed that streamIDs are sorted
 	streamIDs := pso.streamIDs
 
@@ -1768,7 +1858,7 @@ func (p *part) searchByStreamIDs(pso *partitionSearchOptions, qs *QueryStats, bh
 
 	for len(ibhs) > 0 && len(streamIDs) > 0 {
 		if needStop(stopCh) {
-			return
+			return nil
 		}
 
 		// locate streamID equal or bigger than the streamID in ibhs[0]
@@ -1803,7 +1893,11 @@ func (p *part) searchByStreamIDs(pso *partitionSearchOptions, qs *QueryStats, bh
 			continue
 		}
 
-		bhss.bhs = ibh.mustReadBlockHeaders(bhss.bhs[:0], p, qs)
+		var err error
+		bhss.bhs, err = ibh.mustReadBlockHeaders(bhss.bhs[:0], p, qs)
+		if err != nil {
+			return err
+		}
 
 		bhs := bhss.bhs
 		for len(bhs) > 0 {
@@ -1820,7 +1914,7 @@ func (p *part) searchByStreamIDs(pso *partitionSearchOptions, qs *QueryStats, bh
 					continue
 				}
 				if !scheduleBlockSearch(bh) {
-					return
+					return nil
 				}
 			}
 			if len(bhs) == 0 {
@@ -1846,6 +1940,7 @@ func (p *part) searchByStreamIDs(pso *partitionSearchOptions, qs *QueryStats, bh
 	case <-stopCh:
 	case workCh <- bswb:
 	}
+	return nil
 }
 
 func appendPartsInTimeRange(dst, src []*partWrapper, minTimestamp, maxTimestamp int64) []*partWrapper {

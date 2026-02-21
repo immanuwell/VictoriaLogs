@@ -30,14 +30,14 @@ type statsRateProcessor struct {
 	rowsCount uint64
 }
 
-func (srp *statsRateProcessor) updateStatsForAllRows(_ statsFunc, br *blockResult) int {
+func (srp *statsRateProcessor) updateStatsForAllRows(_ statsFunc, br *blockResult) (int, error) {
 	srp.rowsCount += uint64(br.rowsLen)
-	return 0
+	return 0, nil
 }
 
-func (srp *statsRateProcessor) updateStatsForRow(_ statsFunc, _ *blockResult, _ int) int {
+func (srp *statsRateProcessor) updateStatsForRow(_ statsFunc, _ *blockResult, _ int) (int, error) {
 	srp.rowsCount++
-	return 0
+	return 0, nil
 }
 
 func (srp *statsRateProcessor) mergeState(_ *chunkedAllocator, _ statsFunc, sfp statsProcessor) {

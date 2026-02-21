@@ -152,7 +152,7 @@ func (ps *pipeSort) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (ps *pipeSort) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (ps *pipeSort) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	if ps.limit > 0 {
 		return newPipeTopkProcessor(ps, stopCh, cancel, ppNext)
 	}
@@ -171,7 +171,7 @@ func (ps *pipeSort) addPartitionByTime(step int64) {
 	}
 }
 
-func newPipeSortProcessor(ps *pipeSort, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func newPipeSortProcessor(ps *pipeSort, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	maxStateSize := int64(float64(memory.Allowed()) * 0.2)
 
 	psp := &pipeSortProcessor{
@@ -193,7 +193,7 @@ func newPipeSortProcessor(ps *pipeSort, stopCh <-chan struct{}, cancel func(), p
 type pipeSortProcessor struct {
 	ps     *pipeSort
 	stopCh <-chan struct{}
-	cancel func()
+	cancel func(error)
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeSortProcessorShard]
@@ -203,6 +203,8 @@ type pipeSortProcessor struct {
 }
 
 type pipeSortProcessorShard struct {
+	psp *pipeSortProcessor
+
 	// ps points to the parent pipeSort.
 	ps *pipeSort
 
@@ -275,7 +277,12 @@ func (c *sortBlockByColumn) getF64ValueAtRow(rowIdx int) float64 {
 // writeBlock writes br to shard.
 func (shard *pipeSortProcessorShard) writeBlock(br *blockResult) {
 	// clone br, so it could be owned by shard
-	br = br.clone()
+	var err error
+	br, err = br.clone()
+	if err != nil {
+		shard.psp.cancel(err)
+		return
+	}
 	cs := br.getColumns()
 
 	byFields := shard.ps.byFields
@@ -284,7 +291,11 @@ func (shard *pipeSortProcessorShard) writeBlock(br *blockResult) {
 
 		columnValues := shard.columnValues[:0]
 		for _, c := range cs {
-			values := c.getValues(br)
+			values, err := c.getValues(br)
+			if err != nil {
+				shard.psp.cancel(err)
+				return
+			}
 			columnValues = append(columnValues, values)
 		}
 		shard.columnValues = columnValues
@@ -355,7 +366,11 @@ func (shard *pipeSortProcessorShard) writeBlock(br *blockResult) {
 			}
 
 			// pre-populate values in order to track better br memory usage
-			values := c.getValues(br)
+			values, err := c.getValues(br)
+			if err != nil {
+				shard.psp.cancel(err)
+				return
+			}
 			bc.i64Values = shard.createInt64Values(values)
 			bc.f64Values = shard.createFloat64Values(values)
 		}
@@ -463,7 +478,7 @@ func (psp *pipeSortProcessor) writeBlock(workerID uint, br *blockResult) {
 			// The state size is too big. Stop processing data in order to avoid OOM crash.
 			if remaining+stateSizeBudgetChunk >= 0 {
 				// Notify worker goroutines to stop calling writeBlock() in order to save CPU time.
-				psp.cancel()
+				psp.cancel(nil)
 			}
 			return
 		}
@@ -473,19 +488,20 @@ func (psp *pipeSortProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.writeBlock(br)
 }
 
-func (psp *pipeSortProcessor) flush() error {
+func (psp *pipeSortProcessor) flush() {
 	if n := psp.stateSizeBudget.Load(); n <= 0 {
-		return fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", psp.ps.String(), psp.maxStateSize/(1<<20))
+		psp.cancel(fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", psp.ps.String(), psp.maxStateSize/(1<<20)))
+		return
 	}
 
 	if needStop(psp.stopCh) {
-		return nil
+		return
 	}
 
 	// Sort every shard in parallel
 	shards := psp.shards.All()
 	if len(shards) == 0 {
-		return nil
+		return
 	}
 
 	var wg sync.WaitGroup
@@ -504,7 +520,7 @@ func (psp *pipeSortProcessor) flush() error {
 	wg.Wait()
 
 	if needStop(psp.stopCh) {
-		return nil
+		return
 	}
 
 	// Merge sorted results across shards
@@ -515,7 +531,7 @@ func (psp *pipeSortProcessor) flush() error {
 		}
 	}
 	if len(sh) == 0 {
-		return nil
+		return
 	}
 
 	heap.Init(&sh)
@@ -534,7 +550,7 @@ func (psp *pipeSortProcessor) flush() error {
 			shardNextIdx = 0
 
 			if needStop(psp.stopCh) {
-				return nil
+				return
 			}
 
 			continue
@@ -552,7 +568,7 @@ func (psp *pipeSortProcessor) flush() error {
 			shardNextIdx = 0
 
 			if needStop(psp.stopCh) {
-				return nil
+				return
 			}
 		}
 	}
@@ -563,8 +579,6 @@ func (psp *pipeSortProcessor) flush() error {
 		}
 	}
 	wctx.flush()
-
-	return nil
 }
 
 type pipeSortWriteContext struct {
@@ -643,13 +657,21 @@ func (wctx *pipeSortWriteContext) writeNextRow(shard *pipeSortProcessorShard) {
 	br := b.br
 	byColumns := b.byColumns
 	for i := range byFields {
-		v := byColumns[i].c.getValueAtRow(br, rr.rowIdx)
+		v, err := byColumns[i].c.getValueAtRow(br, rr.rowIdx)
+		if err != nil {
+			shard.psp.cancel(err)
+			return
+		}
 		rcs[rankFields+i].addValue(v)
 		wctx.valuesLen += len(v)
 	}
 
 	for i, c := range b.otherColumns {
-		v := c.getValueAtRow(br, rr.rowIdx)
+		v, err := c.getValueAtRow(br, rr.rowIdx)
+		if err != nil {
+			shard.psp.cancel(err)
+			return
+		}
 		rcs[rankFields+len(byFields)+i].addValue(v)
 		wctx.valuesLen += len(v)
 	}
@@ -725,8 +747,16 @@ func sortBlockLess(shardA *pipeSortProcessorShard, rowIdxA int, shardB *pipeSort
 
 		if cA.c.isTime && cB.c.isTime {
 			// Fast path - sort by _time
-			timestampsA := bA.br.getTimestamps()
-			timestampsB := bB.br.getTimestamps()
+			timestampsA, err := bA.br.getTimestamps()
+			if err != nil {
+				shardA.psp.cancel(err)
+				return false
+			}
+			timestampsB, err := bB.br.getTimestamps()
+			if err != nil {
+				shardB.psp.cancel(err)
+				return false
+			}
 			tA := timestampsA[rrA.rowIdx]
 			tB := timestampsB[rrB.rowIdx]
 			if tA == tB {
@@ -773,8 +803,16 @@ func sortBlockLess(shardA *pipeSortProcessorShard, rowIdxA int, shardB *pipeSort
 		}
 
 		// Fall back to string sorting
-		sA := cA.c.getValueAtRow(bA.br, rrA.rowIdx)
-		sB := cB.c.getValueAtRow(bB.br, rrB.rowIdx)
+		sA, err := cA.c.getValueAtRow(bA.br, rrA.rowIdx)
+		if err != nil {
+			shardA.psp.cancel(err)
+			return false
+		}
+		sB, err := cB.c.getValueAtRow(bB.br, rrB.rowIdx)
+		if err != nil {
+			shardB.psp.cancel(err)
+			return false
+		}
 		if sA == sB {
 			continue
 		}

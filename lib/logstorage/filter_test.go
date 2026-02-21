@@ -1,6 +1,7 @@
 package logstorage
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"strings"
@@ -119,7 +120,12 @@ func testFilterMatchForStorage(t *testing.T, s *Storage, tenantID TenantID, f fi
 	t.Helper()
 
 	sso := newTestStorageSearchOptions([]TenantID{tenantID}, f, []string{neededColumnName, "_time"})
-	qs := &QueryStats{}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	qctx := &QueryContext{
+		Context:    ctx,
+		cancel:     cancel,
+		QueryStats: &QueryStats{},
+	}
 
 	type result struct {
 		value     string
@@ -129,15 +135,21 @@ func testFilterMatchForStorage(t *testing.T, s *Storage, tenantID TenantID, f fi
 	var results []result
 
 	const workersCount = 3
-	s.searchParallel(workersCount, sso, qs, nil, func(_ uint, br *blockResult) {
+	s.searchParallel(workersCount, qctx, sso, nil, func(_ uint, br *blockResult) {
 		// Verify columns
 		cs := br.getColumns()
 		if len(cs) != 2 {
 			t.Fatalf("unexpected number of columns in blockResult; got %d; want 2", len(cs))
 		}
 		mc := getMatchingColumns(br, []string{neededColumnName})
-		values := mc.cs[0].getValues(br)
-		timestamps := br.getTimestamps()
+		values, err := mc.cs[0].getValues(br)
+		if err != nil {
+			t.Fatalf("unexpecter error getValues: %s", err)
+		}
+		timestamps, err := br.getTimestamps()
+		if err != nil {
+			t.Fatalf("unexpecter error getTimestamps: %s", err)
+		}
 		resultsMu.Lock()
 		for i, v := range values {
 			results = append(results, result{

@@ -62,10 +62,11 @@ func (ph *pipeHash) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (ph *pipeHash) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (ph *pipeHash) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	php := &pipeHashProcessor{
 		ph:     ph,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 	php.shards.Init = func(shard *pipeHashProcessorShard) {
 		shard.reset()
@@ -78,6 +79,7 @@ type pipeHashProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeHashProcessorShard]
+	cancel func(error)
 }
 
 type pipeHashProcessorShard struct {
@@ -106,7 +108,11 @@ func (php *pipeHashProcessor) writeBlock(workerID uint, br *blockResult) {
 		br.addResultColumnConst(shard.rc)
 	} else {
 		// Slow path for other columns
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			php.cancel(err)
+			return
+		}
 		vEncoded := ""
 		for rowIdx := range values {
 			if rowIdx == 0 || values[rowIdx] != values[rowIdx-1] {
@@ -153,9 +159,7 @@ func getFloat64CompatibleHash(v string) float64 {
 	return float64(h)
 }
 
-func (php *pipeHashProcessor) flush() error {
-	return nil
-}
+func (php *pipeHashProcessor) flush() {}
 
 func parsePipeHash(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("hash") {

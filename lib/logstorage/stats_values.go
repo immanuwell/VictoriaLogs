@@ -36,25 +36,29 @@ type statsValuesProcessor struct {
 	values []string
 }
 
-func (svp *statsValuesProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (svp *statsValuesProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sv := sf.(*statsValues)
 	if svp.limitReached(sv) {
 		// Limit on the number of unique values has been reached
-		return 0
+		return 0, nil
 	}
 
 	stateSizeIncrease := 0
 
 	mc := getMatchingColumns(br, sv.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		stateSizeIncrease += svp.updateStatsForAllRowsColumn(c, br)
+		state, err := svp.updateStatsForAllRowsColumn(c, br)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
 	}
-	putMatchingColumns(mc)
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (svp *statsValuesProcessor) updateStatsForAllRowsColumn(c *blockResultColumn, br *blockResult) int {
+func (svp *statsValuesProcessor) updateStatsForAllRowsColumn(c *blockResultColumn, br *blockResult) (int, error) {
 	stateSizeIncrease := 0
 	if c.isConst {
 		v := strings.Clone(c.valuesEncoded[0])
@@ -67,7 +71,7 @@ func (svp *statsValuesProcessor) updateStatsForAllRowsColumn(c *blockResultColum
 		svp.values = values
 
 		stateSizeIncrease += br.rowsLen * int(unsafe.Sizeof(values[0]))
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	}
 	if c.valueType == valueTypeDict {
 		dictValues := make([]string, len(c.dictValues))
@@ -77,19 +81,27 @@ func (svp *statsValuesProcessor) updateStatsForAllRowsColumn(c *blockResultColum
 		}
 
 		values := svp.values
-		for _, encodedValue := range c.getValuesEncoded(br) {
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, encodedValue := range valuesEncoded {
 			idx := encodedValue[0]
 			values = append(values, dictValues[idx])
 		}
 		svp.values = values
 
 		stateSizeIncrease += br.rowsLen * int(unsafe.Sizeof(values[0]))
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	}
 
 	values := svp.values
 	vPrev := ""
-	for _, v := range c.getValues(br) {
+	vs, err := c.getValues(br)
+	if err != nil {
+		return 0, err
+	}
+	for _, v := range vs {
 		if len(values) == 0 || v != vPrev {
 			vPrev = strings.Clone(v)
 			stateSizeIncrease += len(vPrev)
@@ -99,28 +111,31 @@ func (svp *statsValuesProcessor) updateStatsForAllRowsColumn(c *blockResultColum
 	svp.values = values
 
 	stateSizeIncrease += br.rowsLen * int(unsafe.Sizeof(values[0]))
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (svp *statsValuesProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (svp *statsValuesProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sv := sf.(*statsValues)
 	if svp.limitReached(sv) {
 		// Limit on the number of unique values has been reached
-		return 0
+		return 0, nil
 	}
 
 	stateSizeIncrease := 0
 
 	mc := getMatchingColumns(br, sv.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		stateSizeIncrease += svp.updateStatsForRowColumn(c, br, rowIdx)
+		state, err := svp.updateStatsForRowColumn(c, br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
 	}
-	putMatchingColumns(mc)
-
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (svp *statsValuesProcessor) updateStatsForRowColumn(c *blockResultColumn, br *blockResult, rowIdx int) int {
+func (svp *statsValuesProcessor) updateStatsForRowColumn(c *blockResultColumn, br *blockResult, rowIdx int) (int, error) {
 	stateSizeIncrease := 0
 	if c.isConst {
 		v := strings.Clone(c.valuesEncoded[0])
@@ -129,11 +144,14 @@ func (svp *statsValuesProcessor) updateStatsForRowColumn(c *blockResultColumn, b
 		svp.values = append(svp.values, v)
 		stateSizeIncrease += int(unsafe.Sizeof(svp.values[0]))
 
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	}
 	if c.valueType == valueTypeDict {
 		// collect unique non-zero c.dictValues
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		dictIdx := valuesEncoded[rowIdx][0]
 		v := strings.Clone(c.dictValues[dictIdx])
 		stateSizeIncrease += len(v)
@@ -141,18 +159,21 @@ func (svp *statsValuesProcessor) updateStatsForRowColumn(c *blockResultColumn, b
 		svp.values = append(svp.values, v)
 		stateSizeIncrease += int(unsafe.Sizeof(svp.values[0]))
 
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	}
 
 	// collect unique values for the given rowIdx.
-	v := c.getValueAtRow(br, rowIdx)
+	v, err := c.getValueAtRow(br, rowIdx)
+	if err != nil {
+		return 0, err
+	}
 	v = strings.Clone(v)
 	stateSizeIncrease += len(v)
 
 	svp.values = append(svp.values, v)
 	stateSizeIncrease += int(unsafe.Sizeof(svp.values[0]))
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
 func (svp *statsValuesProcessor) mergeState(_ *chunkedAllocator, sf statsFunc, sfp statsProcessor) {

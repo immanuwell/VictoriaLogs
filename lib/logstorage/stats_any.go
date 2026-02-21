@@ -30,19 +30,19 @@ type statsAnyProcessor struct {
 	value string
 }
 
-func (sap *statsAnyProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (sap *statsAnyProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sa := sf.(*statsAny)
 	if sap.value != "" {
-		return 0
+		return 0, nil
 	}
 
 	return sap.updateState(sa, br, 0)
 }
 
-func (sap *statsAnyProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (sap *statsAnyProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sa := sf.(*statsAny)
 	if sap.value != "" {
-		return 0
+		return 0, nil
 	}
 
 	return sap.updateState(sa, br, rowIdx)
@@ -77,15 +77,18 @@ func (sap *statsAnyProcessor) importState(src []byte, _ <-chan struct{}) (int, e
 	return stateSize, nil
 }
 
-func (sap *statsAnyProcessor) updateState(sa *statsAny, br *blockResult, rowIdx int) int {
+func (sap *statsAnyProcessor) updateState(sa *statsAny, br *blockResult, rowIdx int) (int, error) {
 	c := br.getColumnByName(sa.fieldName)
-	v := c.getValueAtRow(br, rowIdx)
+	v, err := c.getValueAtRow(br, rowIdx)
+	if err != nil {
+		return 0, err
+	}
 	if v != "" {
 		sap.value = strings.Clone(v)
-		return len(v)
+		return len(v), nil
 	}
 
-	return 0
+	return 0, nil
 }
 
 func (sap *statsAnyProcessor) finalizeStats(_ statsFunc, dst []byte, _ <-chan struct{}) []byte {

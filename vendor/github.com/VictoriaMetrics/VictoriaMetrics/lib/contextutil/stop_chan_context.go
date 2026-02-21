@@ -20,6 +20,21 @@ func NewStopChanContext(stopCh <-chan struct{}) (context.Context, context.Cancel
 	return context.WithCancel(ctx)
 }
 
+// NewStopChanWithCauseContext returns new context for the given stopCh, together with cancel function.
+//
+// The returned context is canceled on the following events:
+//
+//   - when stopCh is closed
+//   - when the returned CancelCauseFunc is called
+//
+// The caller must call the returned CancelFunc when the context is no longer needed.
+func NewStopChanWithCauseContext(stopCh <-chan struct{}) (context.Context, context.CancelCauseFunc) {
+	ctx := &stopChanContext{
+		stopCh: stopCh,
+	}
+	return context.WithCancelCause(ctx)
+}
+
 // stopChanContext implements context.Context for stopCh passed to newStopChanContext.
 type stopChanContext struct {
 	stopCh <-chan struct{}

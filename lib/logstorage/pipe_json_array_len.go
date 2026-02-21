@@ -61,10 +61,11 @@ func (pl *pipeJSONArrayLen) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pl *pipeJSONArrayLen) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pl *pipeJSONArrayLen) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	plp := &pipeJSONArrayLenProcessor{
 		pl:     pl,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 	plp.shards.Init = func(shard *pipeJSONArrayLenProcessorShard) {
 		shard.reset()
@@ -77,6 +78,7 @@ type pipeJSONArrayLenProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeJSONArrayLenProcessorShard]
+	cancel func(error)
 }
 
 type pipeJSONArrayLenProcessorShard struct {
@@ -110,7 +112,11 @@ func (plp *pipeJSONArrayLenProcessor) writeBlock(workerID uint, br *blockResult)
 		br.addResultColumnConst(shard.rc)
 	} else {
 		// Slow path for other columns
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			plp.cancel(err)
+			return
+		}
 		vEncoded := ""
 		for rowIdx := range values {
 			if rowIdx == 0 || values[rowIdx] != values[rowIdx-1] {
@@ -162,9 +168,7 @@ func (shard *pipeJSONArrayLenProcessorShard) getJSONArrayLen(v string) int {
 	return len(shard.tmpValues)
 }
 
-func (plp *pipeJSONArrayLenProcessor) flush() error {
-	return nil
-}
+func (plp *pipeJSONArrayLenProcessor) flush() {}
 
 func parsePipeJSONArrayLen(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("json_array_len") {

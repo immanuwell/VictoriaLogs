@@ -76,10 +76,11 @@ func (pc *pipeCoalesce) visitSubqueries(_ func(q *Query)) {
 
 }
 
-func (pc *pipeCoalesce) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pc *pipeCoalesce) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeCoalesceProcessor{
 		pc:     pc,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -87,6 +88,7 @@ func (pc *pipeCoalesce) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppN
 type pipeCoalesceProcessor struct {
 	pc     *pipeCoalesce
 	ppNext pipeProcessor
+	cancel func(error)
 
 	shards atomicutil.Slice[pipeCoalesceProcessorShard]
 }
@@ -116,7 +118,11 @@ func (pcp *pipeCoalesceProcessor) writeBlock(workerID uint, br *blockResult) {
 	for rowIdx := 0; rowIdx < br.rowsLen; rowIdx++ {
 		value := ""
 		for _, srcColumn := range shard.srcColumns {
-			v := srcColumn.getValueAtRow(br, rowIdx)
+			v, err := srcColumn.getValueAtRow(br, rowIdx)
+			if err != nil {
+				pcp.cancel(err)
+				return
+			}
 			if v != "" {
 				value = v
 				break
@@ -138,9 +144,7 @@ func (pcp *pipeCoalesceProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.rc.reset()
 }
 
-func (pcp *pipeCoalesceProcessor) flush() error {
-	return nil
-}
+func (pcp *pipeCoalesceProcessor) flush() {}
 
 // parsePipeCoalesce parses '| coalesce(field1, field2, field3) default "default value" as result_field'
 func parsePipeCoalesce(lex *lexer) (pipe, error) {

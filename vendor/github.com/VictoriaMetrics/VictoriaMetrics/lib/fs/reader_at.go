@@ -25,6 +25,18 @@ var disableMincore = flag.Bool("fs.disableMincore", false, "Whether to disable t
 // Disable mmap for architectures with 32-bit pointers in order to be able to work with files exceeding 2^32 bytes.
 const is32BitPtr = (^uintptr(0) >> 32) == 0
 
+// ReadAtCloser is rand-access read interface.
+type ReadAtCloser interface {
+	// Path must return path for the reader (e.g. file path, url or in-memory reference)
+	Path() string
+
+	// ReadAt reads len(p) bytes from offset off to p.
+	ReadAt(p []byte, off int64) error
+
+	// MustClose must close the reader.
+	MustClose()
+}
+
 // MustReadAtCloser is rand-access read interface.
 type MustReadAtCloser interface {
 	// Path must return path for the reader (e.g. file path, url or in-memory reference)
@@ -55,6 +67,12 @@ type ReaderAt struct {
 // Path returns path to r.
 func (r *ReaderAt) Path() string {
 	return r.path
+}
+
+// ReadAt reads len(p) bytes at off from r.
+func (r *ReaderAt) ReadAt(p []byte, off int64) error {
+	r.MustReadAt(p, off)
+	return nil
 }
 
 // MustReadAt reads len(p) bytes at off from r.
@@ -153,10 +171,10 @@ func (r *ReaderAt) MustFadviseSequentialRead(prefetch bool) {
 	}
 }
 
-// MustOpenReaderAt opens ReaderAt for reading from the file located at path.
+// OpenReaderAt opens ReaderAt for reading from the file located at path.
 //
 // MustClose must be called on the returned ReaderAt when it is no longer needed.
-func MustOpenReaderAt(path string) *ReaderAt {
+func OpenReaderAt(path string) *ReaderAt {
 	var r ReaderAt
 	r.path = path
 	return &r

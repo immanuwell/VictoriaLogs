@@ -54,10 +54,11 @@ func (po *pipeOffset) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (po *pipeOffset) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (po *pipeOffset) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeOffsetProcessor{
 		po:     po,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -66,6 +67,7 @@ type pipeOffsetProcessor struct {
 	ppNext pipeProcessor
 
 	rowsProcessed atomic.Uint64
+	cancel        func(error)
 }
 
 func (pop *pipeOffsetProcessor) writeBlock(workerID uint, br *blockResult) {
@@ -85,13 +87,14 @@ func (pop *pipeOffsetProcessor) writeBlock(workerID uint, br *blockResult) {
 	}
 
 	rowsSkip := pop.po.offset - rowsProcessed
-	br.skipRows(int(rowsSkip))
+	if err := br.skipRows(int(rowsSkip)); err != nil {
+		pop.cancel(err)
+		return
+	}
 	pop.ppNext.writeBlock(workerID, br)
 }
 
-func (pop *pipeOffsetProcessor) flush() error {
-	return nil
-}
+func (pop *pipeOffsetProcessor) flush() {}
 
 func parsePipeOffset(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("offset", "skip") {

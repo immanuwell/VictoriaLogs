@@ -76,7 +76,7 @@ func (pc *pipeCopy) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pc *pipeCopy) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pc *pipeCopy) newPipeProcessor(_ int, _ <-chan struct{}, _ func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeCopyProcessor{
 		pc:     pc,
 		ppNext: ppNext,
@@ -97,9 +97,7 @@ func (pcp *pipeCopyProcessor) writeBlock(workerID uint, br *blockResult) {
 	pcp.ppNext.writeBlock(workerID, br)
 }
 
-func (pcp *pipeCopyProcessor) flush() error {
-	return nil
-}
+func (pcp *pipeCopyProcessor) flush() {}
 
 func parsePipeCopy(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("copy", "cp") {

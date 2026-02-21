@@ -47,7 +47,7 @@ func (ps *pipeQueryStatsLocal) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (ps *pipeQueryStatsLocal) newPipeProcessor(_ int, stopCh <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (ps *pipeQueryStatsLocal) newPipeProcessor(_ int, stopCh <-chan struct{}, _ func(error), ppNext pipeProcessor) pipeProcessor {
 	psp := &pipeQueryStatsLocalProcessor{
 		ppNext: ppNext,
 	}
@@ -73,7 +73,6 @@ func (psp *pipeQueryStatsLocalProcessor) writeBlock(_ uint, _ *blockResult) {
 	// Nothing to do - query stats is passed from the remote storage nodes via a side channel.
 }
 
-func (psp *pipeQueryStatsLocalProcessor) flush() error {
+func (psp *pipeQueryStatsLocalProcessor) flush() {
 	psp.qs.writeToPipeProcessor(psp.ppNext, psp.queryDurationNsecs)
-	return nil
 }

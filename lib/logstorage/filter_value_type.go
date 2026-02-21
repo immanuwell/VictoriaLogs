@@ -35,7 +35,7 @@ func (fv *filterValueType) matchRowByField(fields []Field, fieldName string) boo
 	return fv.valueType == "string"
 }
 
-func (fv *filterValueType) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fv *filterValueType) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	var typ string
 	c := br.getColumnByName(fieldName)
 	if c.isConst {
@@ -50,27 +50,29 @@ func (fv *filterValueType) applyToBlockResultByField(br *blockResult, bm *bitmap
 	if fv.valueType != typ {
 		bm.resetBits()
 	}
+	return nil
 }
 
-func (fv *filterValueType) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fv *filterValueType) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	// Verify whether fp matches const column
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if fv.valueType != "const" {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether fp matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		bm.resetBits()
-		return
+		return err
 	}
 
 	typ := ch.valueType.String()
 	if fv.valueType != typ {
 		bm.resetBits()
 	}
+	return nil
 }

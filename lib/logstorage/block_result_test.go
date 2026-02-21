@@ -228,7 +228,10 @@ func TestBlockResultMustInitFromRows(t *testing.T) {
 		for rowIdx := range rows {
 			var fields []Field
 			for _, c := range cs {
-				v := c.getValueAtRow(br, rowIdx)
+				v, err := c.getValueAtRow(br, rowIdx)
+				if err != nil {
+					t.Fatalf("unexpected error\nerr: %s", err)
+				}
 				fields = append(fields, Field{
 					Name:  c.name,
 					Value: v,

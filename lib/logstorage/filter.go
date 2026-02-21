@@ -16,10 +16,10 @@ type filter interface {
 	matchRow(fields []Field) bool
 
 	// applyToBlockSearch must update bm according to the filter applied to the given bs block
-	applyToBlockSearch(bs *blockSearch, bm *bitmap)
+	applyToBlockSearch(bs *blockSearch, bm *bitmap) error
 
 	// applyToBlockResult must update bm according to the filter applied to the given br block
-	applyToBlockResult(br *blockResult, bm *bitmap)
+	applyToBlockResult(br *blockResult, bm *bitmap) error
 }
 
 // fieldFilter must implement filtering for log entries by the given fieldName
@@ -31,10 +31,10 @@ type fieldFilter interface {
 	matchRowByField(fields []Field, fieldName string) bool
 
 	// applyToBlockSearch must update bm according to the filter for the given fieldName applied to the given bs block
-	applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string)
+	applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error
 
 	// applyToBlockResult must update bm according to the filter for the given fieldName applied to the given br block
-	applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string)
+	applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error
 }
 
 // visitFilterRecursive recursively calls visitFunc for filters inside f.

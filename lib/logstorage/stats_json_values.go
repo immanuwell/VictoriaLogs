@@ -76,51 +76,62 @@ type statsJSONValuesProcessor struct {
 	fieldsBuf []Field
 }
 
-func (svp *statsJSONValuesProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (svp *statsJSONValuesProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sv := sf.(*statsJSONValues)
 	if svp.limitReached(sv) {
 		// Limit on the number of entries has been reached
-		return 0
+		return 0, nil
 	}
 
 	stateSizeIncrease := 0
 	mc := getMatchingColumns(br, sv.fieldFilters)
+	defer putMatchingColumns(mc)
 	mc.sort()
 	for rowIdx := range br.rowsLen {
-		stateSizeIncrease += svp.updateStateForRow(br, mc.cs, rowIdx)
+		state, err := svp.updateStateForRow(br, mc.cs, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
 	}
-	putMatchingColumns(mc)
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (svp *statsJSONValuesProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (svp *statsJSONValuesProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sv := sf.(*statsJSONValues)
 	if svp.limitReached(sv) {
 		// Limit on the number of entries has been reached
-		return 0
+		return 0, nil
 	}
 
 	mc := getMatchingColumns(br, sv.fieldFilters)
+	defer putMatchingColumns(mc)
 	mc.sort()
-	stateSizeIncrease := svp.updateStateForRow(br, mc.cs, rowIdx)
-	putMatchingColumns(mc)
+	stateSizeIncrease, err := svp.updateStateForRow(br, mc.cs, rowIdx)
+	if err != nil {
+		return stateSizeIncrease, err
+	}
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (svp *statsJSONValuesProcessor) updateStateForRow(br *blockResult, cs []*blockResultColumn, rowIdx int) int {
+func (svp *statsJSONValuesProcessor) updateStateForRow(br *blockResult, cs []*blockResultColumn, rowIdx int) (int, error) {
 	svp.fieldsBuf = slicesutil.SetLength(svp.fieldsBuf, len(cs))
 	for i, c := range cs {
+		values, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
 		svp.fieldsBuf[i] = Field{
 			Name:  c.name,
-			Value: c.getValueAtRow(br, rowIdx),
+			Value: values,
 		}
 	}
 
 	value := string(MarshalFieldsToJSON(nil, svp.fieldsBuf))
 	svp.entries = append(svp.entries, value)
-	return int(unsafe.Sizeof(value)) + len(value)
+	return int(unsafe.Sizeof(value)) + len(value), nil
 }
 
 func (svp *statsJSONValuesProcessor) mergeState(_ *chunkedAllocator, sf statsFunc, sfp statsProcessor) {

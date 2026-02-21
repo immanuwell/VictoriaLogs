@@ -29,29 +29,36 @@ type statsSumLenProcessor struct {
 	sumLen uint64
 }
 
-func (ssp *statsSumLenProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (ssp *statsSumLenProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	ss := sf.(*statsSumLen)
 
 	mc := getMatchingColumns(br, ss.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		ssp.sumLen += c.sumLenValues(br)
+		v, err := c.sumLenValues(br)
+		if err != nil {
+			return 0, err
+		}
+		ssp.sumLen += v
 	}
-	putMatchingColumns(mc)
 
-	return 0
+	return 0, nil
 }
 
-func (ssp *statsSumLenProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (ssp *statsSumLenProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	ss := sf.(*statsSumLen)
 
 	mc := getMatchingColumns(br, ss.fieldFilters)
+	defer putMatchingColumns(mc)
 	for _, c := range mc.cs {
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
 		ssp.sumLen += uint64(len(v))
 	}
-	putMatchingColumns(mc)
 
-	return 0
+	return 0, nil
 }
 
 func (ssp *statsSumLenProcessor) mergeState(_ *chunkedAllocator, _ statsFunc, sfp statsProcessor) {

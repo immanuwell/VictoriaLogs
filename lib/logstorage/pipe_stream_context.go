@@ -99,7 +99,7 @@ func (pc *pipeStreamContext) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pc *pipeStreamContext) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (pc *pipeStreamContext) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	maxStateSize := int64(float64(memory.Allowed()) * 0.2)
 
 	pcp := &pipeStreamContextProcessor{
@@ -111,6 +111,7 @@ func (pc *pipeStreamContext) newPipeProcessor(_ int, stopCh <-chan struct{}, can
 		maxStateSize: maxStateSize,
 	}
 	pcp.shards.Init = func(shard *pipeStreamContextProcessorShard) {
+		shard.pcp = pcp
 		shard.pc = pc
 	}
 	pcp.stateSizeBudget.Store(maxStateSize)
@@ -121,7 +122,7 @@ func (pc *pipeStreamContext) newPipeProcessor(_ int, stopCh <-chan struct{}, can
 type pipeStreamContextProcessor struct {
 	pc     *pipeStreamContext
 	stopCh <-chan struct{}
-	cancel func()
+	cancel func(error)
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeStreamContextProcessorShard]
@@ -285,15 +286,15 @@ func (pcp *pipeStreamContextProcessor) executeQuery(streamID, qStr string, neede
 
 	stateSize := 0
 
-	ctxWithCancel, cancel := contextutil.NewStopChanContext(pcp.stopCh)
-	defer cancel()
+	ctxWithCancel, cancel := contextutil.NewStopChanWithCauseContext(pcp.stopCh)
+	defer cancel(nil)
 
 	writeBlock := func(_ uint, br *blockResult) {
 		mu.Lock()
 		defer mu.Unlock()
 
 		if stateSize > stateSizeBudget {
-			cancel()
+			cancel(nil)
 			return
 		}
 
@@ -302,12 +303,19 @@ func (pcp *pipeStreamContextProcessor) executeQuery(streamID, qStr string, neede
 				return
 			}
 
-			if !contextRows[i].canUpdate(br) {
+			if ok, err := contextRows[i].canUpdate(br); err != nil {
+				pcp.cancel(err)
+				return
+			} else if !ok {
 				// Fast path - skip reading block timestamps for the given ctx.
 				continue
 			}
 
-			timestamps := br.getTimestamps()
+			timestamps, err := br.getTimestamps()
+			if err != nil {
+				pcp.cancel(err)
+				return
+			}
 
 			for j, timestamp := range timestamps {
 				if i > 0 && timestamp <= contextRows[i-1].neededTimestamp {
@@ -316,7 +324,12 @@ func (pcp *pipeStreamContextProcessor) executeQuery(streamID, qStr string, neede
 				if i+1 < len(contextRows) && timestamp >= contextRows[i+1].neededTimestamp {
 					continue
 				}
-				stateSize += contextRows[i].update(br, j, timestamp)
+				size, err := contextRows[i].update(br, j, timestamp)
+				if err != nil {
+					pcp.cancel(err)
+					return
+				}
+				stateSize += size
 			}
 		}
 	}
@@ -327,7 +340,7 @@ func (pcp *pipeStreamContextProcessor) executeQuery(streamID, qStr string, neede
 	}
 
 	qctxOrig := pcp.pc.qctx
-	qctx := NewQueryContext(ctxWithCancel, qctxOrig.QueryStats, []TenantID{tenantID}, q, qctxOrig.AllowPartialResponse, qctxOrig.HiddenFieldsFilters)
+	qctx := NewQueryContext(ctxWithCancel, cancel, qctxOrig.QueryStats, []TenantID{tenantID}, q, qctxOrig.AllowPartialResponse, qctxOrig.HiddenFieldsFilters)
 	if err := pcp.pc.runQuery(qctx, writeBlock); err != nil {
 		return nil, 0, err
 	}
@@ -385,98 +398,125 @@ type streamContextRows struct {
 	rowsMatched []*streamContextRow
 }
 
-func (ctx *streamContextRows) canUpdate(br *blockResult) bool {
+func (ctx *streamContextRows) canUpdate(br *blockResult) (bool, error) {
 	if ctx.linesBefore > 0 {
 		if len(ctx.rowsBefore) < ctx.linesBefore {
-			return true
+			return true, nil
 		}
 		minTimestamp := ctx.rowsBefore[0].timestamp
 		maxTimestamp := ctx.neededTimestamp
-		if br.intersectsTimeRange(minTimestamp, maxTimestamp) {
-			return true
+		ok, err := br.intersectsTimeRange(minTimestamp, maxTimestamp)
+		if err != nil {
+			return false, err
+		} else if ok {
+			return true, nil
 		}
 	}
 
 	if ctx.linesAfter > 0 {
 		if len(ctx.rowsAfter) < ctx.linesAfter {
-			return true
+			return true, nil
 		}
 		minTimestamp := ctx.neededTimestamp
 		maxTimestamp := ctx.rowsAfter[0].timestamp
-		if br.intersectsTimeRange(minTimestamp, maxTimestamp) {
-			return true
+		ok, err := br.intersectsTimeRange(minTimestamp, maxTimestamp)
+		if err != nil {
+			return false, err
+		} else if ok {
+			return true, nil
 		}
 	}
 
 	if ctx.linesBefore <= 0 && ctx.linesAfter <= 0 {
 		if len(ctx.rowsMatched) == 0 {
-			return true
+			return true, nil
 		}
 		timestamp := ctx.rowsMatched[0].timestamp
-		if br.intersectsTimeRange(timestamp, timestamp) {
-			return true
+		ok, err := br.intersectsTimeRange(timestamp, timestamp)
+		if err != nil {
+			return false, err
+		} else if ok {
+			return true, nil
 		}
 	}
 
-	return false
+	return false, nil
 }
 
-func (ctx *streamContextRows) update(br *blockResult, rowIdx int, rowTimestamp int64) int {
+func (ctx *streamContextRows) update(br *blockResult, rowIdx int, rowTimestamp int64) (int, error) {
 	if rowTimestamp < ctx.neededTimestamp {
 		if ctx.linesBefore <= 0 {
-			return 0
+			return 0, nil
 		}
 		if len(ctx.rowsBefore) < ctx.linesBefore {
-			r := ctx.copyRowAtIdx(br, rowIdx, rowTimestamp)
+			r, err := ctx.copyRowAtIdx(br, rowIdx, rowTimestamp)
+			if err != nil {
+				return 0, err
+			}
 			heap.Push(&ctx.rowsBefore, r)
-			return r.sizeBytes()
+			return r.sizeBytes(), nil
 		}
 		if rowTimestamp <= ctx.rowsBefore[0].timestamp {
-			return 0
+			return 0, nil
 		}
-		r := ctx.copyRowAtIdx(br, rowIdx, rowTimestamp)
+		r, err := ctx.copyRowAtIdx(br, rowIdx, rowTimestamp)
+		if err != nil {
+			return 0, err
+		}
 		stateSizeChange := r.sizeBytes() - ctx.rowsBefore[0].sizeBytes()
 		ctx.rowsBefore[0] = r
 		heap.Fix(&ctx.rowsBefore, 0)
-		return stateSizeChange
+		return stateSizeChange, nil
 	}
 
 	if rowTimestamp > ctx.neededTimestamp {
 		if ctx.linesAfter <= 0 {
-			return 0
+			return 0, nil
 		}
 		if len(ctx.rowsAfter) < ctx.linesAfter {
-			r := ctx.copyRowAtIdx(br, rowIdx, rowTimestamp)
+			r, err := ctx.copyRowAtIdx(br, rowIdx, rowTimestamp)
+			if err != nil {
+				return 0, err
+			}
 			heap.Push(&ctx.rowsAfter, r)
-			return r.sizeBytes()
+			return r.sizeBytes(), nil
 		}
 		if rowTimestamp >= ctx.rowsAfter[0].timestamp {
-			return 0
+			return 0, nil
 		}
-		r := ctx.copyRowAtIdx(br, rowIdx, rowTimestamp)
+		r, err := ctx.copyRowAtIdx(br, rowIdx, rowTimestamp)
+		if err != nil {
+			return 0, err
+		}
 		stateSizeChange := r.sizeBytes() - ctx.rowsAfter[0].sizeBytes()
 		ctx.rowsAfter[0] = r
 		heap.Fix(&ctx.rowsAfter, 0)
-		return stateSizeChange
+		return stateSizeChange, nil
 	}
 
 	// rowTimestamp == ctx.neededTimestamp
-	r := ctx.copyRowAtIdx(br, rowIdx, rowTimestamp)
+	r, err := ctx.copyRowAtIdx(br, rowIdx, rowTimestamp)
+	if err != nil {
+		return 0, err
+	}
 	ctx.rowsMatched = append(ctx.rowsMatched, r)
-	return r.sizeBytes()
+	return r.sizeBytes(), nil
 }
 
-func (ctx *streamContextRows) copyRowAtIdx(br *blockResult, rowIdx int, rowTimestamp int64) *streamContextRow {
+func (ctx *streamContextRows) copyRowAtIdx(br *blockResult, rowIdx int, rowTimestamp int64) (*streamContextRow, error) {
 	cs := br.getColumns()
 	if len(cs) == 0 {
 		return &streamContextRow{
 			timestamp: rowTimestamp,
-		}
+		}, nil
 	}
 
 	fields := make([]Field, len(cs))
 	for i, c := range cs {
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return nil, err
+		}
 		fields[i] = Field{
 			Name:  strings.Clone(c.name),
 			Value: strings.Clone(v),
@@ -485,7 +525,7 @@ func (ctx *streamContextRows) copyRowAtIdx(br *blockResult, rowIdx int, rowTimes
 	return &streamContextRow{
 		timestamp: rowTimestamp,
 		fields:    fields,
-	}
+	}, nil
 }
 
 func getTenantIDFromStreamIDString(s string) (TenantID, bool) {
@@ -497,6 +537,8 @@ func getTenantIDFromStreamIDString(s string) (TenantID, bool) {
 }
 
 type pipeStreamContextProcessorShard struct {
+	pcp *pipeStreamContextProcessor
+
 	// pc points to the parent pipeStreamContext.
 	pc *pipeStreamContext
 
@@ -556,20 +598,28 @@ func (shard *pipeStreamContextProcessorShard) writeBlock(pcp *pipeStreamContextP
 	m := shard.getM()
 	if len(m) > pipeStreamContextMaxStreams {
 		// Ignore the rest of blocks because the number of streams is too big for showing stream context
-		pcp.cancel()
+		pcp.cancel(nil)
 		return
 	}
 
 	cs := br.getColumns()
 	cStreamID := br.getColumnByName("_stream_id")
 	stateSize := 0
-	timestamps := br.getTimestamps()
+	timestamps, err := br.getTimestamps()
+	if err != nil {
+		shard.pcp.cancel(err)
+		return
+	}
 	for i, timestamp := range timestamps {
 		fields := make([]Field, len(cs))
 		stateSize += int(unsafe.Sizeof(fields[0])) * len(fields)
 
 		for j, c := range cs {
-			v := c.getValueAtRow(br, i)
+			v, err := c.getValueAtRow(br, i)
+			if err != nil {
+				shard.pcp.cancel(err)
+				return
+			}
 			fields[j] = Field{
 				Name:  strings.Clone(c.name),
 				Value: strings.Clone(v),
@@ -583,7 +633,11 @@ func (shard *pipeStreamContextProcessorShard) writeBlock(pcp *pipeStreamContextP
 		}
 		stateSize += int(unsafe.Sizeof(row))
 
-		streamID := cStreamID.getValueAtRow(br, i)
+		streamID, err := cStreamID.getValueAtRow(br, i)
+		if err != nil {
+			shard.pcp.cancel(err)
+			return
+		}
 		rows, ok := m[streamID]
 		if !ok {
 			stateSize += len(streamID)
@@ -593,7 +647,7 @@ func (shard *pipeStreamContextProcessorShard) writeBlock(pcp *pipeStreamContextP
 		m[streamID] = rows
 		if len(rows) > pipeStreamContextMaxRowsPerStream {
 			// Ignore the rest of blocks because the number of rows is too big for showing stream context
-			pcp.cancel()
+			pcp.cancel(nil)
 			return
 		}
 	}
@@ -622,7 +676,7 @@ func (pcp *pipeStreamContextProcessor) writeBlock(workerID uint, br *blockResult
 			// The state size is too big. Stop processing data in order to avoid OOM crash.
 			if remaining+stateSizeBudgetChunk >= 0 {
 				// Notify worker goroutines to stop calling writeBlock() in order to save CPU time.
-				pcp.cancel()
+				pcp.cancel(nil)
 			}
 			return
 		}
@@ -632,10 +686,11 @@ func (pcp *pipeStreamContextProcessor) writeBlock(workerID uint, br *blockResult
 	shard.writeBlock(pcp, br)
 }
 
-func (pcp *pipeStreamContextProcessor) flush() error {
+func (pcp *pipeStreamContextProcessor) flush() {
 	n := pcp.stateSizeBudget.Load()
 	if n <= 0 {
-		return fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", pcp.pc.String(), pcp.maxStateSize/(1<<20))
+		pcp.cancel(fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", pcp.pc.String(), pcp.maxStateSize/(1<<20)))
+		return
 	}
 	if n > math.MaxInt {
 		logger.Panicf("BUG: stateSizeBudget shouldn't exceed math.MaxInt=%v; got %d", math.MaxInt, n)
@@ -645,14 +700,14 @@ func (pcp *pipeStreamContextProcessor) flush() error {
 	// merge state across shards
 	shards := pcp.shards.All()
 	if len(shards) == 0 {
-		return nil
+		return
 	}
 
 	m := shards[0].getM()
 	shards = shards[1:]
 	for _, shard := range shards {
 		if needStop(pcp.stopCh) {
-			return nil
+			return
 		}
 
 		for streamID, rowsSrc := range shard.getM() {
@@ -666,8 +721,8 @@ func (pcp *pipeStreamContextProcessor) flush() error {
 	}
 
 	if len(m) > pipeStreamContextMaxStreams {
-		return fmt.Errorf("logs from too many streams passed to 'stream_context': %d; the maximum supported number of streams, which can be passed to 'stream_context' is %d; "+
-			"narrow down the matching log streams with additional filters according to https://docs.victoriametrics.com/victorialogs/logsql/#filters", len(m), pipeStreamContextMaxStreams)
+		pcp.cancel(fmt.Errorf("logs from too many streams passed to 'stream_context': %d; the maximum supported number of streams, which can be passed to 'stream_context' is %d; "+
+			"narrow down the matching log streams with additional filters according to https://docs.victoriametrics.com/victorialogs/logsql/#filters", len(m), pipeStreamContextMaxStreams))
 	}
 
 	// write result
@@ -680,16 +735,17 @@ func (pcp *pipeStreamContextProcessor) flush() error {
 	for _, streamID := range streamIDs {
 		rows := m[streamID]
 		if len(rows) > pipeStreamContextMaxRowsPerStream {
-			return fmt.Errorf("too many logs from a single stream passed to 'stream_context': %d; the maximum supported number of logs, which can be passed to 'stream_context' is %d; "+
+			pcp.cancel(fmt.Errorf("too many logs from a single stream passed to 'stream_context': %d; the maximum supported number of logs, which can be passed to 'stream_context' is %d; "+
 				"narrow down the matching logs with additional filters according to https://docs.victoriametrics.com/victorialogs/logsql/#filters",
-				len(rows), pipeStreamContextMaxRowsPerStream)
+				len(rows), pipeStreamContextMaxRowsPerStream))
 		}
 		streamRowss, err := pcp.getStreamRowss(streamID, rows, stateSizeBudget)
 		if err != nil {
-			return err
+			pcp.cancel(err)
+			return
 		}
 		if needStop(pcp.stopCh) {
-			return nil
+			return
 		}
 
 		// Write streamRowss to the output.
@@ -706,8 +762,6 @@ func (pcp *pipeStreamContextProcessor) flush() error {
 	}
 
 	wctx.flush()
-
-	return nil
 }
 
 // `stream_context` pipe results are expected to be investigated by humans.

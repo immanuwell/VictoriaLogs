@@ -48,29 +48,32 @@ func (fo *filterOr) matchRow(fields []Field) bool {
 	return false
 }
 
-func (fo *filterOr) applyToBlockResult(br *blockResult, bm *bitmap) {
+func (fo *filterOr) applyToBlockResult(br *blockResult, bm *bitmap) error {
 	bmResult := getBitmap(bm.bitsLen)
 	bmTmp := getBitmap(bm.bitsLen)
 	defer putBitmap(bmTmp)
 	defer putBitmap(bmResult)
-
 	bmResult.copyFrom(bm)
 	for _, f := range fo.filters {
 		bmTmp.copyFrom(bmResult)
-		f.applyToBlockResult(br, bmTmp)
+		if err := f.applyToBlockResult(br, bmTmp); err != nil {
+			return err
+		}
 		bmResult.andNot(bmTmp)
 		if bmResult.isZero() {
-			return
+			return nil
 		}
 	}
 	bm.andNot(bmResult)
+	return nil
 }
 
-func (fo *filterOr) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
-	if !fo.matchBloomFilters(bs) {
+func (fo *filterOr) applyToBlockSearch(bs *blockSearch, bm *bitmap) error {
+	matches, err := fo.matchBloomFilters(bs)
+	if err != nil || !matches {
 		// Fast path - fo doesn't match bloom filters.
 		bm.resetBits()
-		return
+		return err
 	}
 
 	bmResult := getBitmap(bm.bitsLen)
@@ -81,50 +84,61 @@ func (fo *filterOr) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
 	bmResult.copyFrom(bm)
 	for _, f := range fo.filters {
 		bmTmp.copyFrom(bmResult)
-		f.applyToBlockSearch(bs, bmTmp)
+		if err := f.applyToBlockSearch(bs, bmTmp); err != nil {
+			return err
+		}
 		bmResult.andNot(bmTmp)
 		if bmResult.isZero() {
-			return
+			return nil
 		}
 	}
 	bm.andNot(bmResult)
+	return nil
 }
 
-func (fo *filterOr) matchBloomFilters(bs *blockSearch) bool {
+func (fo *filterOr) matchBloomFilters(bs *blockSearch) (bool, error) {
 	byFieldTokens := fo.getByFieldTokens()
 	if len(byFieldTokens) == 0 {
-		return true
+		return true, nil
 	}
 
 	for _, ft := range byFieldTokens {
 		fieldName := ft.field
 		tokens := ft.tokens
 
-		v := bs.getConstColumnValue(fieldName)
+		v, err := bs.getConstColumnValue(fieldName)
+		if err != nil {
+			return false, err
+		}
 		if v != "" {
 			if matchStringByAllTokens(v, tokens) {
-				return true
+				return true, nil
 			}
 			continue
 		}
 
-		ch := bs.getColumnHeader(fieldName)
+		ch, err := bs.getColumnHeader(fieldName)
+		if err != nil {
+			return false, err
+		}
 		if ch == nil {
 			continue
 		}
 
 		if ch.valueType == valueTypeDict {
 			if matchDictValuesByAllTokens(ch.valuesDict.values, tokens) {
-				return true
+				return true, nil
 			}
 			continue
 		}
-		if matchBloomFilterAllTokens(bs, ch, ft.tokensHashes) {
-			return true
+		if matches, err := matchBloomFilterAllTokens(bs, ch, ft.tokensHashes); err != nil {
+			return false, err
+		} else if matches {
+			return true, nil
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 func (fo *filterOr) getByFieldTokens() []fieldTokens {

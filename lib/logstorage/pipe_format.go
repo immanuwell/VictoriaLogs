@@ -101,11 +101,13 @@ func (pf *pipeFormat) visitSubqueries(visitFunc func(q *Query)) {
 	pf.iff.visitSubqueries(visitFunc)
 }
 
-func (pf *pipeFormat) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
-	return &pipeFormatProcessor{
+func (pf *pipeFormat) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
+	pfp := &pipeFormatProcessor{
 		pf:     pf,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
+	return pfp
 }
 
 type pipeFormatProcessor struct {
@@ -113,6 +115,7 @@ type pipeFormatProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeFormatProcessorShard]
+	cancel func(error)
 }
 
 type pipeFormatProcessorShard struct {
@@ -134,7 +137,10 @@ func (pfp *pipeFormatProcessor) writeBlock(workerID uint, br *blockResult) {
 	if iff := pf.iff; iff != nil {
 		bm.init(br.rowsLen)
 		bm.setBits()
-		iff.f.applyToBlockResult(br, bm)
+		if err := iff.f.applyToBlockResult(br, bm); err != nil {
+			pfp.cancel(err)
+			return
+		}
 		if bm.isZero() {
 			pfp.ppNext.writeBlock(workerID, br)
 			return
@@ -147,30 +153,40 @@ func (pfp *pipeFormatProcessor) writeBlock(workerID uint, br *blockResult) {
 	for rowIdx := range br.rowsLen {
 		v := ""
 		if pf.iff == nil || bm.isSetBit(rowIdx) {
-			v = shard.formatRow(pf, br, rowIdx)
+			var err error
+			v, err = shard.formatRow(pf, br, rowIdx)
+			if err != nil {
+				pfp.cancel(err)
+				return
+			}
 			if v == "" && pf.skipEmptyResults || pf.keepOriginalFields {
-				if vOrig := resultColumn.getValueAtRow(br, rowIdx); vOrig != "" {
+				if vOrig, err := resultColumn.getValueAtRow(br, rowIdx); err != nil {
+					pfp.cancel(err)
+					return
+				} else if vOrig != "" {
 					v = vOrig
 				}
 			}
 		} else {
-			v = resultColumn.getValueAtRow(br, rowIdx)
+			var err error
+			v, err = resultColumn.getValueAtRow(br, rowIdx)
+			if err != nil {
+				pfp.cancel(err)
+				return
+			}
 		}
 		shard.rc.addValue(v)
 	}
 
 	br.addResultColumn(shard.rc)
 	pfp.ppNext.writeBlock(workerID, br)
-
 	shard.a.reset()
 	shard.rc.reset()
 }
 
-func (pfp *pipeFormatProcessor) flush() error {
-	return nil
-}
+func (pfp *pipeFormatProcessor) flush() {}
 
-func (shard *pipeFormatProcessorShard) formatRow(pf *pipeFormat, br *blockResult, rowIdx int) string {
+func (shard *pipeFormatProcessorShard) formatRow(pf *pipeFormat, br *blockResult, rowIdx int) (string, error) {
 	b := shard.a.b
 	bLen := len(b)
 	for _, step := range pf.steps {
@@ -180,7 +196,10 @@ func (shard *pipeFormatProcessorShard) formatRow(pf *pipeFormat, br *blockResult
 		}
 
 		c := br.getColumnByName(step.field)
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return "", err
+		}
 		switch step.fieldOpt {
 		case "base64decode":
 			result, ok := appendBase64Decode(b, v)
@@ -249,7 +268,7 @@ func (shard *pipeFormatProcessorShard) formatRow(pf *pipeFormat, br *blockResult
 	}
 	shard.a.b = b
 
-	return bytesutil.ToUnsafeString(b[bLen:])
+	return bytesutil.ToUnsafeString(b[bLen:]), nil
 }
 
 func parsePipeFormat(lex *lexer) (pipe, error) {

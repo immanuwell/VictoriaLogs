@@ -57,8 +57,10 @@ func (ps *pipeSample) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (ps *pipeSample) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
-	psp := &pipeSampleProcessor{}
+func (ps *pipeSample) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
+	psp := &pipeSampleProcessor{
+		cancel: cancel,
+	}
 	psp.shards.Init = func(shard *pipeSampleProcessorShard) {
 		shard.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 		shard.d = float64(ps.sample) - 1
@@ -71,6 +73,7 @@ func (ps *pipeSample) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNex
 
 type pipeSampleProcessor struct {
 	shards atomicutil.Slice[pipeSampleProcessorShard]
+	cancel func(error)
 }
 
 type pipeSampleProcessorShard struct {
@@ -107,16 +110,28 @@ func (psp *pipeSampleProcessor) writeBlock(workerID uint, br *blockResult) {
 			return
 		}
 
-		shard.writeRow(workerID, br, rowIdx)
+		err := shard.writeRow(workerID, br, rowIdx)
+		if err != nil {
+			psp.cancel(err)
+			return
+		}
 		shard.rowNext += shard.nextStep()
 	}
 }
 
-func (shard *pipeSampleProcessorShard) writeRow(workerID uint, br *blockResult, rowIdx uint64) {
+func (shard *pipeSampleProcessorShard) writeRow(workerID uint, br *blockResult, rowIdx uint64) error {
 	cs := br.getColumns()
 	rcs := slicesutil.SetLength(shard.rcs, len(cs))
+	defer func() {
+		clear(rcs)
+		shard.rcs = rcs
+		shard.br.reset()
+	}()
 	for i, c := range cs {
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return err
+		}
 
 		rcs[i] = resultColumn{
 			name:   c.name,
@@ -126,14 +141,10 @@ func (shard *pipeSampleProcessorShard) writeRow(workerID uint, br *blockResult, 
 	shard.br.setResultColumns(rcs, 1)
 	shard.ppNext.writeBlock(workerID, &shard.br)
 
-	clear(rcs)
-	shard.rcs = rcs
-	shard.br.reset()
-}
-
-func (psp *pipeSampleProcessor) flush() error {
 	return nil
 }
+
+func (psp *pipeSampleProcessor) flush() {}
 
 func parsePipeSample(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("sample") {

@@ -148,10 +148,10 @@ func (sus *statsCountUniqHashSet) mergeState(src *statsCountUniqHashSet, stopCh 
 	mergeUint64Set(&sus.strings, src.strings, stopCh)
 }
 
-func (sup *statsCountUniqHashProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (sup *statsCountUniqHashProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	su := sf.(*statsCountUniqHash)
 	if sup.limitReached(su) {
-		return 0
+		return 0, nil
 	}
 
 	stateSizeIncrease := 0
@@ -167,7 +167,10 @@ func (sup *statsCountUniqHashProcessor) updateStatsForAllRows(sf statsFunc, br *
 	columnValues := sup.columnValues[:0]
 	for _, f := range su.fields {
 		c := br.getColumnByName(f)
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return 0, err
+		}
 		columnValues = append(columnValues, values)
 	}
 	sup.columnValues = columnValues
@@ -201,13 +204,13 @@ func (sup *statsCountUniqHashProcessor) updateStatsForAllRows(sf statsFunc, br *
 		stateSizeIncrease += sup.updateStateString(keyBuf)
 	}
 	sup.keyBuf = keyBuf
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (sup *statsCountUniqHashProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (sup *statsCountUniqHashProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	su := sf.(*statsCountUniqHash)
 	if sup.limitReached(su) {
-		return 0
+		return 0, nil
 	}
 
 	if len(su.fields) == 1 {
@@ -221,7 +224,10 @@ func (sup *statsCountUniqHashProcessor) updateStatsForRow(sf statsFunc, br *bloc
 
 	for _, f := range su.fields {
 		c := br.getColumnByName(f)
-		v := c.getValueAtRow(br, rowIdx)
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
 		if v != "" {
 			allEmptyValues = false
 		}
@@ -231,17 +237,20 @@ func (sup *statsCountUniqHashProcessor) updateStatsForRow(sf statsFunc, br *bloc
 
 	if allEmptyValues {
 		// Do not count empty values
-		return 0
+		return 0, nil
 	}
-	return sup.updateStateString(keyBuf)
+	return sup.updateStateString(keyBuf), nil
 }
 
-func (sup *statsCountUniqHashProcessor) updateStatsForAllRowsSingleColumn(br *blockResult, columnName string) int {
+func (sup *statsCountUniqHashProcessor) updateStatsForAllRowsSingleColumn(br *blockResult, columnName string) (int, error) {
 	stateSizeIncrease := 0
 	c := br.getColumnByName(columnName)
 	if c.isTime {
 		// Count unique timestamps
-		timestamps := br.getTimestamps()
+		timestamps, err := br.getTimestamps()
+		if err != nil {
+			return 0, err
+		}
 		for i := range timestamps {
 			if i > 0 && timestamps[i-1] == timestamps[i] {
 				// This timestamp has been already counted.
@@ -249,32 +258,38 @@ func (sup *statsCountUniqHashProcessor) updateStatsForAllRowsSingleColumn(br *bl
 			}
 			stateSizeIncrease += sup.updateStateTimestamp(timestamps[i])
 		}
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	}
 	if c.isConst {
 		// count unique const values
 		v := c.valuesEncoded[0]
 		if v == "" {
 			// Do not count empty values
-			return 0
+			return 0, nil
 		}
-		return sup.updateStateGeneric(v)
+		return sup.updateStateGeneric(v), nil
 	}
 
 	switch c.valueType {
 	case valueTypeDict:
 		// count unique non-zero dict values for the selected logs
 		sup.tmpNum = 0
-		c.forEachDictValue(br, func(v string) {
+		err := c.forEachDictValue(br, func(v string) {
 			if v == "" {
 				// Do not count empty values
 				return
 			}
 			sup.tmpNum += sup.updateStateGeneric(v)
 		})
-		return sup.tmpNum
+		if err != nil {
+			return 0, err
+		}
+		return sup.tmpNum, nil
 	case valueTypeUint8:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for i, v := range values {
 			if i > 0 && values[i-1] == v {
 				continue
@@ -282,9 +297,12 @@ func (sup *statsCountUniqHashProcessor) updateStatsForAllRowsSingleColumn(br *bl
 			n := unmarshalUint8(v)
 			stateSizeIncrease += sup.updateStateUint64(uint64(n))
 		}
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	case valueTypeUint16:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for i, v := range values {
 			if i > 0 && values[i-1] == v {
 				continue
@@ -292,9 +310,12 @@ func (sup *statsCountUniqHashProcessor) updateStatsForAllRowsSingleColumn(br *bl
 			n := unmarshalUint16(v)
 			stateSizeIncrease += sup.updateStateUint64(uint64(n))
 		}
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	case valueTypeUint32:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for i, v := range values {
 			if i > 0 && values[i-1] == v {
 				continue
@@ -302,9 +323,12 @@ func (sup *statsCountUniqHashProcessor) updateStatsForAllRowsSingleColumn(br *bl
 			n := unmarshalUint32(v)
 			stateSizeIncrease += sup.updateStateUint64(uint64(n))
 		}
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	case valueTypeUint64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for i, v := range values {
 			if i > 0 && values[i-1] == v {
 				continue
@@ -312,9 +336,12 @@ func (sup *statsCountUniqHashProcessor) updateStatsForAllRowsSingleColumn(br *bl
 			n := unmarshalUint64(v)
 			stateSizeIncrease += sup.updateStateUint64(n)
 		}
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	case valueTypeInt64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		for i, v := range values {
 			if i > 0 && values[i-1] == v {
 				continue
@@ -322,10 +349,13 @@ func (sup *statsCountUniqHashProcessor) updateStatsForAllRowsSingleColumn(br *bl
 			n := unmarshalInt64(v)
 			stateSizeIncrease += sup.updateStateInt64(n)
 		}
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	default:
 		// Count unique values across column values
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return 0, err
+		}
 		for i, v := range values {
 			if v == "" {
 				// Do not count empty values
@@ -337,71 +367,92 @@ func (sup *statsCountUniqHashProcessor) updateStatsForAllRowsSingleColumn(br *bl
 			}
 			stateSizeIncrease += sup.updateStateGeneric(v)
 		}
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	}
 }
 
-func (sup *statsCountUniqHashProcessor) updateStatsForRowSingleColumn(br *blockResult, columnName string, rowIdx int) int {
+func (sup *statsCountUniqHashProcessor) updateStatsForRowSingleColumn(br *blockResult, columnName string, rowIdx int) (int, error) {
 	c := br.getColumnByName(columnName)
 	if c.isTime {
 		// Count unique timestamps
-		timestamps := br.getTimestamps()
-		return sup.updateStateTimestamp(timestamps[rowIdx])
+		timestamps, err := br.getTimestamps()
+		if err != nil {
+			return 0, err
+		}
+		return sup.updateStateTimestamp(timestamps[rowIdx]), nil
 	}
 	if c.isConst {
 		// count unique const values
 		v := c.valuesEncoded[0]
 		if v == "" {
 			// Do not count empty values
-			return 0
+			return 0, nil
 		}
-		return sup.updateStateGeneric(v)
+		return sup.updateStateGeneric(v), nil
 	}
 
 	switch c.valueType {
 	case valueTypeDict:
 		// count unique non-zero c.dictValues
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		dictIdx := valuesEncoded[rowIdx][0]
 		v := c.dictValues[dictIdx]
 		if v == "" {
 			// Do not count empty values
-			return 0
+			return 0, nil
 		}
-		return sup.updateStateGeneric(v)
+		return sup.updateStateGeneric(v), nil
 	case valueTypeUint8:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		n := unmarshalUint8(v)
-		return sup.updateStateUint64(uint64(n))
+		return sup.updateStateUint64(uint64(n)), nil
 	case valueTypeUint16:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		n := unmarshalUint16(v)
-		return sup.updateStateUint64(uint64(n))
+		return sup.updateStateUint64(uint64(n)), nil
 	case valueTypeUint32:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		n := unmarshalUint32(v)
-		return sup.updateStateUint64(uint64(n))
+		return sup.updateStateUint64(uint64(n)), nil
 	case valueTypeUint64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		n := unmarshalUint64(v)
-		return sup.updateStateUint64(n)
+		return sup.updateStateUint64(n), nil
 	case valueTypeInt64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
 		v := values[rowIdx]
 		n := unmarshalInt64(v)
-		return sup.updateStateInt64(n)
+		return sup.updateStateInt64(n), nil
 	default:
 		// Count unique values for the given rowIdx
-		v := c.getValueAtRow(br, rowIdx)
-		if v == "" {
+		v, err := c.getValueAtRow(br, rowIdx)
+		if err != nil || v == "" {
 			// Do not count empty values
-			return 0
+			return 0, nil
 		}
-		return sup.updateStateGeneric(v)
+		return sup.updateStateGeneric(v), nil
 	}
 }
 

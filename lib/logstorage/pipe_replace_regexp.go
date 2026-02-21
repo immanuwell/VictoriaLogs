@@ -84,14 +84,14 @@ func (pr *pipeReplaceRegexp) visitSubqueries(visitFunc func(q *Query)) {
 	pr.iff.visitSubqueries(visitFunc)
 }
 
-func (pr *pipeReplaceRegexp) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pr *pipeReplaceRegexp) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	updateFunc := func(a *arena, v string) string {
 		bLen := len(a.b)
 		a.b = appendReplaceRegexp(a.b, v, pr.re, pr.replacement, pr.limit)
 		return bytesutil.ToUnsafeString(a.b[bLen:])
 	}
 
-	return newPipeUpdateProcessor(updateFunc, ppNext, pr.field, pr.iff)
+	return newPipeUpdateProcessor(cancel, updateFunc, ppNext, pr.field, pr.iff)
 
 }
 

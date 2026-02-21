@@ -93,6 +93,12 @@ func (cb *Buffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// ReadAt reads len(p) bytes from cb at the offset off.
+func (cb *Buffer) ReadAt(p []byte, off int64) error {
+	cb.MustReadAt(p, off)
+	return nil
+}
+
 // MustReadAt reads len(p) bytes from cb at the offset off.
 func (cb *Buffer) MustReadAt(p []byte, off int64) {
 	if len(p) == 0 {

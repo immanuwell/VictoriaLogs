@@ -90,7 +90,7 @@ func (br *blockResult) reset() {
 }
 
 // clone returns a clone of br, which owns its own data.
-func (br *blockResult) clone() *blockResult {
+func (br *blockResult) clone() (*blockResult, error) {
 	brNew := &blockResult{}
 
 	brNew.rowsLen = br.rowsLen
@@ -103,7 +103,9 @@ func (br *blockResult) clone() *blockResult {
 
 	// Pre-populate values in every column in order to properly calculate the needed backing buffer size below.
 	for _, c := range cs {
-		_ = c.getValues(br)
+		if _, err := c.getValues(br); err != nil {
+			return nil, err
+		}
 	}
 
 	// Calculate the backing buffer size needed for cloning column values.
@@ -119,7 +121,10 @@ func (br *blockResult) clone() *blockResult {
 	}
 	brNew.valuesBuf = make([]string, 0, valuesBufLen)
 
-	srcTimestamps := br.getTimestamps()
+	srcTimestamps, err := br.getTimestamps()
+	if err != nil {
+		return nil, err
+	}
 	brNew.timestampsBuf = make([]int64, len(srcTimestamps))
 	copy(brNew.timestampsBuf, srcTimestamps)
 	brNew.checkTimestampsLen()
@@ -132,7 +137,7 @@ func (br *blockResult) clone() *blockResult {
 
 	// do not clone br.csEmpty - it will be populated by the caller via getColumnByName().
 
-	return brNew
+	return brNew, nil
 }
 
 // initFromFilterAllColumns initializes br from brSrc by copying rows identified by set bits at bm.
@@ -375,20 +380,26 @@ func (br *blockResult) addResultColumnConst(rc resultColumn) {
 }
 
 // initColumns initializes columns in br according to pf.
-func (br *blockResult) initColumns(pf *prefixfilter.Filter) {
+func (br *blockResult) initColumns(pf *prefixfilter.Filter) error {
 	fields, ok := pf.GetAllowStrings()
+	var err error
 	if ok {
 		// Fast path
-		br.initColumnsByFields(fields)
+		err = br.initColumnsByFields(fields)
 	} else {
 		// Slow path
-		br.initColumnsByFilter(pf)
+		err = br.initColumnsByFilter(pf)
+	}
+
+	if err != nil {
+		return err
 	}
 
 	br.csInitFast()
+	return nil
 }
 
-func (br *blockResult) initColumnsByFields(fields []string) {
+func (br *blockResult) initColumnsByFields(fields []string) error {
 	for _, f := range fields {
 		switch f {
 		case "_time":
@@ -399,22 +410,28 @@ func (br *blockResult) initColumnsByFields(fields []string) {
 			if !br.addStreamColumn() {
 				// Skip the current block, since the associated stream tags are missing
 				br.reset()
-				return
+				return nil
 			}
 		default:
-			v := br.bs.getConstColumnValue(f)
+			v, err := br.bs.getConstColumnValue(f)
+			if err != nil {
+				return err
+			}
 			if v != "" {
 				br.addConstColumn(f, v)
-			} else if ch := br.bs.getColumnHeader(f); ch != nil {
+			} else if ch, err := br.bs.getColumnHeader(f); err != nil {
+				return err
+			} else if ch != nil {
 				br.addColumn(ch)
 			} else {
 				br.addConstColumn(f, "")
 			}
 		}
 	}
+	return nil
 }
 
-func (br *blockResult) initColumnsByFilter(pf *prefixfilter.Filter) {
+func (br *blockResult) initColumnsByFilter(pf *prefixfilter.Filter) error {
 	if pf.MatchString("_time") {
 		br.addTimeColumn()
 	}
@@ -427,16 +444,21 @@ func (br *blockResult) initColumnsByFilter(pf *prefixfilter.Filter) {
 		if !br.addStreamColumn() {
 			// Skip the current block, since the associated stream tags are missing
 			br.reset()
-			return
+			return nil
 		}
 	}
 
 	if pf.MatchString("_msg") {
 		// Add _msg column
-		v := br.bs.getConstColumnValue("_msg")
+		v, err := br.bs.getConstColumnValue("_msg")
+		if err != nil {
+			return err
+		}
 		if v != "" {
 			br.addConstColumn("_msg", v)
-		} else if ch := br.bs.getColumnHeader("_msg"); ch != nil {
+		} else if ch, err := br.bs.getColumnHeader("_msg"); err != nil {
+			return err
+		} else if ch != nil {
 			br.addColumn(ch)
 		} else {
 			br.addConstColumn("_msg", "")
@@ -445,7 +467,10 @@ func (br *blockResult) initColumnsByFilter(pf *prefixfilter.Filter) {
 
 	// Add other const columns
 	bs := br.bs
-	csh := bs.getColumnsHeader()
+	csh, err := bs.getColumnsHeader()
+	if err != nil {
+		return err
+	}
 	for _, cc := range csh.constColumns {
 		if isSpecialColumn(cc.Name) {
 			// Special columns have been added above.
@@ -468,6 +493,7 @@ func (br *blockResult) initColumnsByFilter(pf *prefixfilter.Filter) {
 			br.addColumn(ch)
 		}
 	}
+	return nil
 }
 
 func isSpecialColumn(c string) bool {
@@ -499,32 +525,43 @@ func (br *blockResult) mustInit(bs *blockSearch, bm *bitmap) {
 }
 
 // intersectsTimeRange returns true if br timestamps intersect [minTimestamp .. maxTimestamp] time range.
-func (br *blockResult) intersectsTimeRange(minTimestamp, maxTimestamp int64) bool {
-	return minTimestamp <= br.getMaxTimestamp(minTimestamp) && maxTimestamp >= br.getMinTimestamp(maxTimestamp)
+func (br *blockResult) intersectsTimeRange(minTimestamp, maxTimestamp int64) (bool, error) {
+	foundMinTimestamp, err := br.getMaxTimestamp(minTimestamp)
+	if err != nil {
+		return false, err
+	}
+	foundMaxTimestamp, err := br.getMinTimestamp(maxTimestamp)
+	if err != nil {
+		return false, err
+	}
+	return minTimestamp <= foundMinTimestamp && maxTimestamp >= foundMaxTimestamp, nil
 }
 
-func (br *blockResult) getMinTimestamp(minTimestamp int64) int64 {
+func (br *blockResult) getMinTimestamp(minTimestamp int64) (int64, error) {
 	if br.bs != nil {
 		th := &br.bs.bsw.bh.timestampsHeader
 		if br.isFull() {
 			// Fast path - all the rows in the br are present, so return the minTimestamp
 			// from blockHeader without the need to read the actual timestamps.
-			return min(minTimestamp, th.minTimestamp)
+			return min(minTimestamp, th.minTimestamp), nil
 		}
 		if minTimestamp <= th.minTimestamp {
-			return minTimestamp
+			return minTimestamp, nil
 		}
 	}
 
-	timestamps := br.getTimestamps()
+	timestamps, err := br.getTimestamps()
+	if err != nil {
+		return 0, err
+	}
 	c := br.getColumnByName("_time")
 	if c.isTime {
 		// Slower path - some of the rows in the br are filtered out,
 		// so try obtaining the _time column and return the first timestamp from there.
 		if len(timestamps) > 0 {
-			return min(minTimestamp, timestamps[0])
+			return min(minTimestamp, timestamps[0]), nil
 		}
-		return minTimestamp
+		return minTimestamp, nil
 	}
 
 	// Slow path - need to scan timestamps, since they may be not sorted.
@@ -533,31 +570,34 @@ func (br *blockResult) getMinTimestamp(minTimestamp int64) int64 {
 			minTimestamp = timestamp
 		}
 	}
-	return minTimestamp
+	return minTimestamp, nil
 }
 
-func (br *blockResult) getMaxTimestamp(maxTimestamp int64) int64 {
+func (br *blockResult) getMaxTimestamp(maxTimestamp int64) (int64, error) {
 	if br.bs != nil {
 		th := &br.bs.bsw.bh.timestampsHeader
 		if br.isFull() {
 			// Fast path - all the rows in the br are present, so return the maxTimestamp
 			// from blockHeader without the need to read the actual timestamps.
-			return max(maxTimestamp, th.maxTimestamp)
+			return max(maxTimestamp, th.maxTimestamp), nil
 		}
 		if maxTimestamp >= th.maxTimestamp {
-			return maxTimestamp
+			return maxTimestamp, nil
 		}
 	}
 
-	timestamps := br.getTimestamps()
+	timestamps, err := br.getTimestamps()
+	if err != nil {
+		return 0, err
+	}
 	c := br.getColumnByName("_time")
 	if c.isTime {
 		// Slower path - some of the rows in the br are filtered out,
 		// so try obtaining the _time column and return the last timestamp from there.
 		if len(timestamps) > 0 {
-			return max(maxTimestamp, timestamps[len(timestamps)-1])
+			return max(maxTimestamp, timestamps[len(timestamps)-1]), nil
 		}
-		return maxTimestamp
+		return maxTimestamp, nil
 	}
 
 	// Slow path - need to scan timestamps, since they may be not sorted.
@@ -566,36 +606,48 @@ func (br *blockResult) getMaxTimestamp(maxTimestamp int64) int64 {
 			maxTimestamp = timestamps[i]
 		}
 	}
-	return maxTimestamp
+	return maxTimestamp, nil
 }
 
-func (br *blockResult) getTimestamps() []int64 {
+func (br *blockResult) getTimestamps() ([]int64, error) {
 	if br.rowsLen > 0 && len(br.timestampsBuf) == 0 {
-		br.initTimestamps()
+		if err := br.initTimestamps(); err != nil {
+			return nil, err
+		}
 	}
-	return br.timestampsBuf
+	return br.timestampsBuf, nil
 }
 
-func (br *blockResult) initTimestamps() {
+func (br *blockResult) initTimestamps() error {
 	if br.brSrc != nil {
-		srcTimestamps := br.brSrc.getTimestamps()
+		srcTimestamps, err := br.brSrc.getTimestamps()
+		if err != nil {
+			return err
+		}
 		br.initTimestampsInternal(srcTimestamps)
-		return
+		return nil
 	}
 	if br.bs != nil {
-		srcTimestamps := br.bs.getTimestamps()
+		srcTimestamps, err := br.bs.getTimestamps()
+		if err != nil {
+			return err
+		}
 		br.initTimestampsInternal(srcTimestamps)
-		return
+		return nil
 	}
 
 	// Try decoding timestamps from _time field
 	c := br.getColumnByName("_time")
-	timestampValues := c.getValues(br)
+	timestampValues, err := c.getValues(br)
+	if err != nil {
+		return err
+	}
 	var ok bool
 	br.timestampsBuf, ok = tryParseTimestamps(br.timestampsBuf[:0], timestampValues)
 	if !ok {
 		br.timestampsBuf = fastnum.AppendInt64Zeros(br.timestampsBuf[:0], br.rowsLen)
 	}
+	return nil
 }
 
 func (br *blockResult) initTimestampsInternal(srcTimestamps []int64) {
@@ -636,14 +688,17 @@ func (br *blockResult) checkTimestampsLen() {
 	}
 }
 
-func (br *blockResult) readValuesEncodedFromColumnHeader(ch *columnHeader) []string {
+func (br *blockResult) readValuesEncodedFromColumnHeader(ch *columnHeader) ([]string, error) {
 	valuesBufLen := len(br.valuesBuf)
 
 	switch ch.valueType {
 	case valueTypeString:
-		visitValuesReadonly(br.bs, ch, br.bm, br.addValues)
+		err := visitValuesReadonly(br.bs, ch, br.bm, br.addValues)
+		if err != nil {
+			return nil, err
+		}
 	case valueTypeDict:
-		visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
+		err := visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
 			checkValuesSize(br.bs, ch, values, 1, "dict")
 			for _, v := range values {
 				dictIdx := v[0]
@@ -653,55 +708,85 @@ func (br *blockResult) readValuesEncodedFromColumnHeader(ch *columnHeader) []str
 			}
 			br.addValues(values)
 		})
+		if err != nil {
+			return nil, err
+		}
 	case valueTypeUint8:
-		visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
+		err := visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
 			checkValuesSize(br.bs, ch, values, 1, "uint8")
 			br.addValues(values)
 		})
+		if err != nil {
+			return nil, err
+		}
 	case valueTypeUint16:
-		visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
+		err := visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
 			checkValuesSize(br.bs, ch, values, 2, "uint16")
 			br.addValues(values)
 		})
+		if err != nil {
+			return nil, err
+		}
 	case valueTypeUint32:
-		visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
+		err := visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
 			checkValuesSize(br.bs, ch, values, 4, "uint32")
 			br.addValues(values)
 		})
+		if err != nil {
+			return nil, err
+		}
 	case valueTypeUint64:
-		visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
+		err := visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
 			checkValuesSize(br.bs, ch, values, 8, "uint64")
 			br.addValues(values)
 		})
+		if err != nil {
+			return nil, err
+		}
 	case valueTypeInt64:
-		visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
+		err := visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
 			checkValuesSize(br.bs, ch, values, 8, "int64")
 			br.addValues(values)
 		})
+		if err != nil {
+			return nil, err
+		}
 	case valueTypeFloat64:
-		visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
+		err := visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
 			checkValuesSize(br.bs, ch, values, 8, "float64")
 			br.addValues(values)
 		})
+		if err != nil {
+			return nil, err
+		}
 	case valueTypeIPv4:
-		visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
+		err := visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
 			checkValuesSize(br.bs, ch, values, 4, "ipv4")
 			br.addValues(values)
 		})
+		if err != nil {
+			return nil, err
+		}
 	case valueTypeTimestampISO8601:
-		visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
+		err := visitValuesReadonly(br.bs, ch, br.bm, func(values []string) {
 			checkValuesSize(br.bs, ch, values, 8, "iso8601")
 			br.addValues(values)
 		})
+		if err != nil {
+			return nil, err
+		}
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d for column %q", br.bs.partPath(), ch.valueType, ch.name)
 	}
 
-	return br.valuesBuf[valuesBufLen:]
+	return br.valuesBuf[valuesBufLen:], nil
 }
 
-func (br *blockResult) readValuesEncodedFromResultColumn(c *blockResultColumn) []string {
-	valuesEncodedSrc := c.getValuesEncoded(br.brSrc)
+func (br *blockResult) readValuesEncodedFromResultColumn(c *blockResultColumn) ([]string, error) {
+	valuesEncodedSrc, err := c.getValuesEncoded(br.brSrc)
+	if err != nil {
+		return nil, err
+	}
 
 	valuesBuf := br.valuesBuf
 	valuesBufLen := len(valuesBuf)
@@ -710,7 +795,7 @@ func (br *blockResult) readValuesEncodedFromResultColumn(c *blockResultColumn) [
 	})
 	br.valuesBuf = valuesBuf
 
-	return valuesBuf[valuesBufLen:]
+	return valuesBuf[valuesBufLen:], nil
 }
 
 func checkValuesSize(bs *blockSearch, ch *columnHeader, values []string, sizeExpected int, typeStr string) {
@@ -774,10 +859,10 @@ func (br *blockResult) addConstColumn(name, value string) {
 	})
 }
 
-func (br *blockResult) newValuesForColumn(c *blockResultColumn) []string {
+func (br *blockResult) newValuesForColumn(c *blockResultColumn) ([]string, error) {
 	if c.isConst {
 		v := c.valuesEncoded[0]
-		return br.getConstValues(v)
+		return br.getConstValues(v), nil
 	}
 	if c.isTime {
 		return br.getTimestampValues()
@@ -806,15 +891,15 @@ func (br *blockResult) newValuesForColumn(c *blockResultColumn) []string {
 		return br.getTimestampISO8601Values(c)
 	default:
 		logger.Panicf("BUG: unknown valueType=%d", c.valueType)
-		return nil
+		return nil, nil
 	}
 }
 
-func (br *blockResult) newValuesBucketedForColumn(c *blockResultColumn, bf *byStatsField) []string {
+func (br *blockResult) newValuesBucketedForColumn(c *blockResultColumn, bf *byStatsField) ([]string, error) {
 	if c.isConst {
 		v := c.valuesEncoded[0]
 		s := br.getBucketedValue(v, bf)
-		return br.getConstValues(s)
+		return br.getConstValues(s), nil
 	}
 	if c.isTime {
 		return br.getBucketedTimestampValues(bf)
@@ -822,8 +907,11 @@ func (br *blockResult) newValuesBucketedForColumn(c *blockResultColumn, bf *bySt
 
 	switch c.valueType {
 	case valueTypeString:
-		valuesEncoded := c.getValuesEncoded(br)
-		return br.getBucketedStrings(valuesEncoded, bf)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return nil, err
+		}
+		return br.getBucketedStrings(valuesEncoded, bf), nil
 	case valueTypeDict:
 		return br.getBucketedDictValues(c, bf)
 	case valueTypeUint8:
@@ -844,7 +932,7 @@ func (br *blockResult) newValuesBucketedForColumn(c *blockResultColumn, bf *bySt
 		return br.getBucketedTimestampISO8601Values(c, bf)
 	default:
 		logger.Panicf("BUG: unknown valueType=%d", c.valueType)
-		return nil
+		return nil, nil
 	}
 }
 
@@ -869,7 +957,7 @@ func (br *blockResult) getConstValues(s string) []string {
 	return values
 }
 
-func (br *blockResult) getBucketedTimestampValues(bf *byStatsField) []string {
+func (br *blockResult) getBucketedTimestampValues(bf *byStatsField) ([]string, error) {
 	bucketSizeInt := int64(bf.bucketSize)
 	if bucketSizeInt <= 0 {
 		bucketSizeInt = 1
@@ -888,7 +976,7 @@ func (br *blockResult) getBucketedTimestampValues(bf *byStatsField) []string {
 			s := bytesutil.ToUnsafeString(buf[bufLen:])
 			br.a.b = buf
 
-			return br.getConstValues(s)
+			return br.getConstValues(s), nil
 		}
 	}
 
@@ -901,7 +989,10 @@ func (br *blockResult) getBucketedTimestampValues(bf *byStatsField) []string {
 
 	var s string
 	timestampTruncatedPrev := int64(0)
-	timestamps := br.getTimestamps()
+	timestamps, err := br.getTimestamps()
+	if err != nil {
+		return nil, err
+	}
 	for i := range timestamps {
 		if i > 0 && timestamps[i-1] == timestamps[i] {
 			values[i] = s
@@ -922,7 +1013,7 @@ func (br *blockResult) getBucketedTimestampValues(bf *byStatsField) []string {
 	br.a.b = buf
 	br.valuesBuf = valuesBuf
 
-	return values
+	return values, nil
 }
 
 func truncateTimestamp(ts, bucketSizeInt, bucketOffsetInt int64, bucketSizeStr string) int64 {
@@ -957,7 +1048,7 @@ func truncateTimestamp(ts, bucketSizeInt, bucketOffsetInt int64, bucketSizeStr s
 	return ts
 }
 
-func (br *blockResult) getTimestampValues() []string {
+func (br *blockResult) getTimestampValues() ([]string, error) {
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
 	valuesBufLen := len(valuesBuf)
@@ -965,7 +1056,10 @@ func (br *blockResult) getTimestampValues() []string {
 	values := valuesBuf[valuesBufLen:]
 
 	var s string
-	timestamps := br.getTimestamps()
+	timestamps, err := br.getTimestamps()
+	if err != nil {
+		return nil, err
+	}
 	for i := range timestamps {
 		if i == 0 || timestamps[i-1] != timestamps[i] {
 			bufLen := len(buf)
@@ -978,7 +1072,7 @@ func (br *blockResult) getTimestampValues() []string {
 	br.a.b = buf
 	br.valuesBuf = valuesBuf
 
-	return values
+	return values, nil
 }
 
 func (br *blockResult) getBucketedStrings(valuesOrig []string, bf *byStatsField) []string {
@@ -1000,14 +1094,17 @@ func (br *blockResult) getBucketedStrings(valuesOrig []string, bf *byStatsField)
 	return values
 }
 
-func (br *blockResult) getBucketedDictValues(c *blockResultColumn, bf *byStatsField) []string {
+func (br *blockResult) getBucketedDictValues(c *blockResultColumn, bf *byStatsField) ([]string, error) {
 	dictValuesBucketed := br.getBucketedStrings(c.dictValues, bf)
 	if areConstValues(dictValuesBucketed) {
 		// fast path - all the bucketed values in the block are the same
-		return br.getConstValues(dictValuesBucketed[0])
+		return br.getConstValues(dictValuesBucketed[0]), nil
 	}
 
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	valuesBuf := br.valuesBuf
 	valuesBufLen := len(valuesBuf)
@@ -1021,11 +1118,14 @@ func (br *blockResult) getBucketedDictValues(c *blockResultColumn, bf *byStatsFi
 
 	br.valuesBuf = valuesBuf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getDictValues(c *blockResultColumn) []string {
-	valuesEncoded := c.getValuesEncoded(br)
+func (br *blockResult) getDictValues(c *blockResultColumn) ([]string, error) {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	valuesBuf := br.valuesBuf
 	valuesBufLen := len(valuesBuf)
@@ -1039,10 +1139,10 @@ func (br *blockResult) getDictValues(c *blockResultColumn) []string {
 
 	br.valuesBuf = valuesBuf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getBucketedUint8Values(c *blockResultColumn, bf *byStatsField) []string {
+func (br *blockResult) getBucketedUint8Values(c *blockResultColumn, bf *byStatsField) ([]string, error) {
 	bucketSizeInt := uint64(bf.bucketSize)
 	if bucketSizeInt <= 0 {
 		bucketSizeInt = 1
@@ -1061,10 +1161,13 @@ func (br *blockResult) getBucketedUint8Values(c *blockResultColumn, bf *byStatsF
 		s := bytesutil.ToUnsafeString(buf[bufLen:])
 		br.a.b = buf
 
-		return br.getConstValues(s)
+		return br.getConstValues(s), nil
 	}
 
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1095,11 +1198,14 @@ func (br *blockResult) getBucketedUint8Values(c *blockResultColumn, bf *byStatsF
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getUint8Values(c *blockResultColumn) []string {
-	valuesEncoded := c.getValuesEncoded(br)
+func (br *blockResult) getUint8Values(c *blockResultColumn) ([]string, error) {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1121,10 +1227,10 @@ func (br *blockResult) getUint8Values(c *blockResultColumn) []string {
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getBucketedUint16Values(c *blockResultColumn, bf *byStatsField) []string {
+func (br *blockResult) getBucketedUint16Values(c *blockResultColumn, bf *byStatsField) ([]string, error) {
 	bucketSizeInt := uint64(bf.bucketSize)
 	if bucketSizeInt <= 0 {
 		bucketSizeInt = 1
@@ -1143,10 +1249,13 @@ func (br *blockResult) getBucketedUint16Values(c *blockResultColumn, bf *byStats
 		s := bytesutil.ToUnsafeString(buf[bufLen:])
 		br.a.b = buf
 
-		return br.getConstValues(s)
+		return br.getConstValues(s), nil
 	}
 
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1177,11 +1286,14 @@ func (br *blockResult) getBucketedUint16Values(c *blockResultColumn, bf *byStats
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getUint16Values(c *blockResultColumn) []string {
-	valuesEncoded := c.getValuesEncoded(br)
+func (br *blockResult) getUint16Values(c *blockResultColumn) ([]string, error) {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1203,10 +1315,10 @@ func (br *blockResult) getUint16Values(c *blockResultColumn) []string {
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getBucketedUint32Values(c *blockResultColumn, bf *byStatsField) []string {
+func (br *blockResult) getBucketedUint32Values(c *blockResultColumn, bf *byStatsField) ([]string, error) {
 	bucketSizeInt := uint64(bf.bucketSize)
 	if bucketSizeInt <= 0 {
 		bucketSizeInt = 1
@@ -1225,10 +1337,13 @@ func (br *blockResult) getBucketedUint32Values(c *blockResultColumn, bf *byStats
 		s := bytesutil.ToUnsafeString(buf[bufLen:])
 		br.a.b = buf
 
-		return br.getConstValues(s)
+		return br.getConstValues(s), nil
 	}
 
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1259,11 +1374,14 @@ func (br *blockResult) getBucketedUint32Values(c *blockResultColumn, bf *byStats
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getUint32Values(c *blockResultColumn) []string {
-	valuesEncoded := c.getValuesEncoded(br)
+func (br *blockResult) getUint32Values(c *blockResultColumn) ([]string, error) {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1285,10 +1403,10 @@ func (br *blockResult) getUint32Values(c *blockResultColumn) []string {
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getBucketedUint64Values(c *blockResultColumn, bf *byStatsField) []string {
+func (br *blockResult) getBucketedUint64Values(c *blockResultColumn, bf *byStatsField) ([]string, error) {
 	bucketSizeInt := uint64(bf.bucketSize)
 	if bucketSizeInt <= 0 {
 		bucketSizeInt = 1
@@ -1307,10 +1425,13 @@ func (br *blockResult) getBucketedUint64Values(c *blockResultColumn, bf *byStats
 		s := bytesutil.ToUnsafeString(buf[bufLen:])
 		br.a.b = buf
 
-		return br.getConstValues(s)
+		return br.getConstValues(s), nil
 	}
 
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1341,7 +1462,7 @@ func (br *blockResult) getBucketedUint64Values(c *blockResultColumn, bf *byStats
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
 func truncateUint64(n, bucketSizeInt, bucketOffsetInt uint64) uint64 {
@@ -1358,8 +1479,11 @@ func truncateUint64(n, bucketSizeInt, bucketOffsetInt uint64) uint64 {
 	return n
 }
 
-func (br *blockResult) getUint64Values(c *blockResultColumn) []string {
-	valuesEncoded := c.getValuesEncoded(br)
+func (br *blockResult) getUint64Values(c *blockResultColumn) ([]string, error) {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1381,10 +1505,10 @@ func (br *blockResult) getUint64Values(c *blockResultColumn) []string {
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getBucketedInt64Values(c *blockResultColumn, bf *byStatsField) []string {
+func (br *blockResult) getBucketedInt64Values(c *blockResultColumn, bf *byStatsField) ([]string, error) {
 	bucketSizeInt := int64(bf.bucketSize)
 	if bucketSizeInt == 0 {
 		bucketSizeInt = 1
@@ -1403,10 +1527,13 @@ func (br *blockResult) getBucketedInt64Values(c *blockResultColumn, bf *byStatsF
 		s := bytesutil.ToUnsafeString(buf[bufLen:])
 		br.a.b = buf
 
-		return br.getConstValues(s)
+		return br.getConstValues(s), nil
 	}
 
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1437,7 +1564,7 @@ func (br *blockResult) getBucketedInt64Values(c *blockResultColumn, bf *byStatsF
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
 func truncateInt64(n, bucketSizeInt, bucketOffsetInt int64) int64 {
@@ -1460,8 +1587,11 @@ func truncateInt64(n, bucketSizeInt, bucketOffsetInt int64) int64 {
 	return n
 }
 
-func (br *blockResult) getInt64Values(c *blockResultColumn) []string {
-	valuesEncoded := c.getValuesEncoded(br)
+func (br *blockResult) getInt64Values(c *blockResultColumn) ([]string, error) {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1483,10 +1613,10 @@ func (br *blockResult) getInt64Values(c *blockResultColumn) []string {
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getBucketedFloat64Values(c *blockResultColumn, bf *byStatsField) []string {
+func (br *blockResult) getBucketedFloat64Values(c *blockResultColumn, bf *byStatsField) ([]string, error) {
 	bucketSize := bf.bucketSize
 	if bucketSize <= 0 {
 		bucketSize = 1
@@ -1508,10 +1638,13 @@ func (br *blockResult) getBucketedFloat64Values(c *blockResultColumn, bf *byStat
 		s := bytesutil.ToUnsafeString(buf[bufLen:])
 		br.a.b = buf
 
-		return br.getConstValues(s)
+		return br.getConstValues(s), nil
 	}
 
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1542,7 +1675,7 @@ func (br *blockResult) getBucketedFloat64Values(c *blockResultColumn, bf *byStat
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
 func truncateFloat64(f float64, p10 float64, bucketSizeP10 int64, bucketOffset float64) float64 {
@@ -1565,8 +1698,11 @@ func truncateFloat64(f float64, p10 float64, bucketSizeP10 int64, bucketOffset f
 	return f
 }
 
-func (br *blockResult) getFloat64Values(c *blockResultColumn) []string {
-	valuesEncoded := c.getValuesEncoded(br)
+func (br *blockResult) getFloat64Values(c *blockResultColumn) ([]string, error) {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1588,10 +1724,10 @@ func (br *blockResult) getFloat64Values(c *blockResultColumn) []string {
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getBucketedIPv4Values(c *blockResultColumn, bf *byStatsField) []string {
+func (br *blockResult) getBucketedIPv4Values(c *blockResultColumn, bf *byStatsField) ([]string, error) {
 	bucketSizeInt := uint32(bf.bucketSize)
 	if bucketSizeInt <= 0 {
 		bucketSizeInt = 1
@@ -1610,10 +1746,13 @@ func (br *blockResult) getBucketedIPv4Values(c *blockResultColumn, bf *byStatsFi
 		s := bytesutil.ToUnsafeString(buf[bufLen:])
 		br.a.b = buf
 
-		return br.getConstValues(s)
+		return br.getConstValues(s), nil
 	}
 
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1644,7 +1783,7 @@ func (br *blockResult) getBucketedIPv4Values(c *blockResultColumn, bf *byStatsFi
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
 func truncateUint32(n, bucketSizeInt, bucketOffsetInt uint32) uint32 {
@@ -1662,8 +1801,11 @@ func truncateUint32(n, bucketSizeInt, bucketOffsetInt uint32) uint32 {
 	return n
 }
 
-func (br *blockResult) getIPv4Values(c *blockResultColumn) []string {
-	valuesEncoded := c.getValuesEncoded(br)
+func (br *blockResult) getIPv4Values(c *blockResultColumn) ([]string, error) {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1685,10 +1827,10 @@ func (br *blockResult) getIPv4Values(c *blockResultColumn) []string {
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getBucketedTimestampISO8601Values(c *blockResultColumn, bf *byStatsField) []string {
+func (br *blockResult) getBucketedTimestampISO8601Values(c *blockResultColumn, bf *byStatsField) ([]string, error) {
 	bucketSizeInt := int64(bf.bucketSize)
 	if bucketSizeInt <= 0 {
 		bucketSizeInt = 1
@@ -1707,10 +1849,13 @@ func (br *blockResult) getBucketedTimestampISO8601Values(c *blockResultColumn, b
 		s := bytesutil.ToUnsafeString(buf[bufLen:])
 		br.a.b = buf
 
-		return br.getConstValues(s)
+		return br.getConstValues(s), nil
 	}
 
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1743,11 +1888,14 @@ func (br *blockResult) getBucketedTimestampISO8601Values(c *blockResultColumn, b
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
-func (br *blockResult) getTimestampISO8601Values(c *blockResultColumn) []string {
-	valuesEncoded := c.getValuesEncoded(br)
+func (br *blockResult) getTimestampISO8601Values(c *blockResultColumn) ([]string, error) {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := br.a.b
 	valuesBuf := br.valuesBuf
@@ -1769,7 +1917,7 @@ func (br *blockResult) getTimestampISO8601Values(c *blockResultColumn) []string 
 	br.valuesBuf = valuesBuf
 	br.a.b = buf
 
-	return values
+	return values, nil
 }
 
 // getBucketedValue returns bucketed s according to the given bf
@@ -2239,8 +2387,11 @@ func getBlockResultColumnIdxByName(cs []*blockResultColumn, name string) int {
 	return -1
 }
 
-func (br *blockResult) skipRows(skipRows int) {
-	timestamps := br.getTimestamps()
+func (br *blockResult) skipRows(skipRows int) error {
+	timestamps, err := br.getTimestamps()
+	if err != nil {
+		return err
+	}
 	br.timestampsBuf = append(br.timestampsBuf[:0], timestamps[skipRows:]...)
 	br.rowsLen -= skipRows
 	br.checkTimestampsLen()
@@ -2253,7 +2404,10 @@ func (br *blockResult) skipRows(skipRows int) {
 			continue
 		}
 
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		if valuesEncoded != nil {
 			c.valuesEncoded = append(valuesEncoded[:0], valuesEncoded[skipRows:]...)
 		}
@@ -2261,10 +2415,14 @@ func (br *blockResult) skipRows(skipRows int) {
 			c.valuesBucketed = append(c.valuesBucketed[:0], c.valuesBucketed[skipRows:]...)
 		}
 	}
+	return nil
 }
 
-func (br *blockResult) truncateRows(keepRows int) {
-	timestamps := br.getTimestamps()
+func (br *blockResult) truncateRows(keepRows int) error {
+	timestamps, err := br.getTimestamps()
+	if err != nil {
+		return err
+	}
 	br.timestampsBuf = append(br.timestampsBuf[:0], timestamps[:keepRows]...)
 	br.rowsLen = keepRows
 	br.checkTimestampsLen()
@@ -2277,7 +2435,10 @@ func (br *blockResult) truncateRows(keepRows int) {
 			continue
 		}
 
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		if valuesEncoded != nil {
 			c.valuesEncoded = valuesEncoded[:keepRows]
 		}
@@ -2285,6 +2446,7 @@ func (br *blockResult) truncateRows(keepRows int) {
 			c.valuesBucketed = append(c.valuesBucketed[:0], c.valuesBucketed[keepRows:]...)
 		}
 	}
+	return nil
 }
 
 // blockResultColumn represents named column from blockResult.
@@ -2413,19 +2575,22 @@ func valuesSizeBytes(values []string) int {
 // getValueAtRow returns value for the value at the given rowIdx.
 //
 // The returned value is valid until br.reset() is called.
-func (c *blockResultColumn) getValueAtRow(br *blockResult, rowIdx int) string {
+func (c *blockResultColumn) getValueAtRow(br *blockResult, rowIdx int) (string, error) {
 	if c.isConst {
 		// Fast path for const column.
-		return c.valuesEncoded[0]
+		return c.valuesEncoded[0], nil
 	}
 	if c.values != nil {
 		// Fast path, which avoids call overhead for getValues().
-		return c.values[rowIdx]
+		return c.values[rowIdx], nil
 	}
 
 	// Slow path - decode all the values and return the given value.
-	values := c.getValues(br)
-	return values[rowIdx]
+	values, err := c.getValues(br)
+	if err != nil {
+		return "", err
+	}
+	return values[rowIdx], nil
 }
 
 // getValuesBucketed returns values for the given column, bucketed according to bf.
@@ -2433,15 +2598,19 @@ func (c *blockResultColumn) getValueAtRow(br *blockResult, rowIdx int) string {
 // The returned values are valid until br.reset() is called.
 //
 // See getValues for obtaining non-bucketed values.
-func (c *blockResultColumn) getValuesBucketed(br *blockResult, bf *byStatsField) []string {
+func (c *blockResultColumn) getValuesBucketed(br *blockResult, bf *byStatsField) ([]string, error) {
 	if values := c.valuesBucketed; values != nil && c.bucketSizeStr == bf.bucketSizeStr && c.bucketOffsetStr == bf.bucketOffsetStr {
-		return values
+		return values, nil
 	}
 
-	c.valuesBucketed = br.newValuesBucketedForColumn(c, bf)
+	var err error
+	c.valuesBucketed, err = br.newValuesBucketedForColumn(c, bf)
+	if err != nil {
+		return nil, err
+	}
 	c.bucketSizeStr = bf.bucketSizeStr
 	c.bucketOffsetStr = bf.bucketOffsetStr
-	return c.valuesBucketed
+	return c.valuesBucketed, nil
 }
 
 // getValues returns values for the given column.
@@ -2449,30 +2618,35 @@ func (c *blockResultColumn) getValuesBucketed(br *blockResult, bf *byStatsField)
 // The returned values are valid until br.reset() is called.
 //
 // See getValuesBucketed for obtaining bucketed values.
-func (c *blockResultColumn) getValues(br *blockResult) []string {
+func (c *blockResultColumn) getValues(br *blockResult) ([]string, error) {
 	if values := c.values; values != nil {
-		return values
+		return values, nil
 	}
 
-	c.values = br.newValuesForColumn(c)
-	return c.values
+	var err error
+	c.values, err = br.newValuesForColumn(c)
+	return c.values, err
 }
 
 // getValuesEncoded returns encoded values for the given column.
 //
 // The returned values are valid until br.reset() is called.
-func (c *blockResultColumn) getValuesEncoded(br *blockResult) []string {
+func (c *blockResultColumn) getValuesEncoded(br *blockResult) ([]string, error) {
 	if c.isTime {
-		return nil
+		return nil, nil
 	}
 
 	if c.valuesEncoded == nil {
-		c.valuesEncoded = c.readValuesEncoded(br)
+		var err error
+		c.valuesEncoded, err = c.readValuesEncoded(br)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return c.valuesEncoded
+	return c.valuesEncoded, nil
 }
 
-func (c *blockResultColumn) readValuesEncoded(br *blockResult) []string {
+func (c *blockResultColumn) readValuesEncoded(br *blockResult) ([]string, error) {
 	if br.bs != nil {
 		return br.readValuesEncodedFromColumnHeader(c.chSrc)
 	}
@@ -2482,7 +2656,7 @@ func (c *blockResultColumn) readValuesEncoded(br *blockResult) []string {
 // forEachDictValue calls f for every matching value in the column dictionary.
 //
 // It properly skips non-matching dict values.
-func (c *blockResultColumn) forEachDictValue(br *blockResult, f func(v string)) {
+func (c *blockResultColumn) forEachDictValue(br *blockResult, f func(v string)) error {
 	if c.valueType != valueTypeDict {
 		logger.Panicf("BUG: unexpected column valueType=%d; want %d", c.valueType, valueTypeDict)
 	}
@@ -2491,14 +2665,18 @@ func (c *blockResultColumn) forEachDictValue(br *blockResult, f func(v string)) 
 		for _, v := range c.dictValues {
 			f(v)
 		}
-		return
+		return nil
 	}
 
 	// Slow path - need to read encoded values in order to filter not referenced columns.
 	a := encoding.GetUint64s(len(c.dictValues))
+	defer encoding.PutUint64s(a)
 	hits := a.A
 	clear(hits)
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return err
+	}
 	for _, v := range valuesEncoded {
 		idx := unmarshalUint8(v)
 		hits[idx]++
@@ -2508,7 +2686,7 @@ func (c *blockResultColumn) forEachDictValue(br *blockResult, f func(v string)) 
 			f(v)
 		}
 	}
-	encoding.PutUint64s(a)
+	return nil
 }
 
 func (br *blockResult) isFull() bool {
@@ -2523,15 +2701,19 @@ func (br *blockResult) isFull() bool {
 // It properly skips non-matching dict values.
 //
 // hits is the number of rows with the given value v in the column.
-func (c *blockResultColumn) forEachDictValueWithHits(br *blockResult, f func(v string, hits uint64)) {
+func (c *blockResultColumn) forEachDictValueWithHits(br *blockResult, f func(v string, hits uint64)) error {
 	if c.valueType != valueTypeDict {
 		logger.Panicf("BUG: unexpected column valueType=%d; want %d", c.valueType, valueTypeDict)
 	}
 
 	a := encoding.GetUint64s(len(c.dictValues))
+	defer encoding.PutUint64s(a)
 	hits := a.A
 	clear(hits)
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return err
+	}
 	for _, v := range valuesEncoded {
 		idx := unmarshalUint8(v)
 		hits[idx]++
@@ -2541,64 +2723,70 @@ func (c *blockResultColumn) forEachDictValueWithHits(br *blockResult, f func(v s
 			f(v, h)
 		}
 	}
-	encoding.PutUint64s(a)
+	return nil
 }
 
-func (c *blockResultColumn) getFloatValueAtRow(br *blockResult, rowIdx int) (float64, bool) {
+func (c *blockResultColumn) getFloatValueAtRow(br *blockResult, rowIdx int) (float64, bool, error) {
 	if c.isConst {
 		v := c.valuesEncoded[0]
-		return tryParseFloat64(v)
+		value, ok := tryParseFloat64(v)
+		return value, ok, nil
 	}
 	if c.isTime {
-		return 0, false
+		return 0, false, nil
 	}
 
-	valuesEncoded := c.getValuesEncoded(br)
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return 0, false, err
+	}
 
 	switch c.valueType {
 	case valueTypeString:
 		v := valuesEncoded[rowIdx]
-		return tryParseFloat64(v)
+		value, ok := tryParseFloat64(v)
+		return value, ok, nil
 	case valueTypeDict:
 		dictIdx := valuesEncoded[rowIdx][0]
 		v := c.dictValues[dictIdx]
-		return tryParseFloat64(v)
+		value, ok := tryParseFloat64(v)
+		return value, ok, nil
 	case valueTypeUint8:
 		v := valuesEncoded[rowIdx]
-		return float64(unmarshalUint8(v)), true
+		return float64(unmarshalUint8(v)), true, nil
 	case valueTypeUint16:
 		v := valuesEncoded[rowIdx]
-		return float64(unmarshalUint16(v)), true
+		return float64(unmarshalUint16(v)), true, nil
 	case valueTypeUint32:
 		v := valuesEncoded[rowIdx]
-		return float64(unmarshalUint32(v)), true
+		return float64(unmarshalUint32(v)), true, nil
 	case valueTypeUint64:
 		v := valuesEncoded[rowIdx]
-		return float64(unmarshalUint64(v)), true
+		return float64(unmarshalUint64(v)), true, nil
 	case valueTypeInt64:
 		v := valuesEncoded[rowIdx]
-		return float64(unmarshalInt64(v)), true
+		return float64(unmarshalInt64(v)), true, nil
 	case valueTypeFloat64:
 		v := valuesEncoded[rowIdx]
 		f := unmarshalFloat64(v)
-		return f, !math.IsNaN(f)
+		return f, !math.IsNaN(f), nil
 	case valueTypeIPv4:
-		return 0, false
+		return 0, false, nil
 	case valueTypeTimestampISO8601:
-		return 0, false
+		return 0, false, nil
 	default:
 		logger.Panicf("BUG: unknown valueType=%d", c.valueType)
-		return 0, false
+		return 0, false, nil
 	}
 }
 
-func (c *blockResultColumn) sumLenValues(br *blockResult) uint64 {
+func (c *blockResultColumn) sumLenValues(br *blockResult) (uint64, error) {
 	if c.isConst {
 		v := c.valuesEncoded[0]
-		return uint64(len(v)) * uint64(br.rowsLen)
+		return uint64(len(v)) * uint64(br.rowsLen), nil
 	}
 	if c.isTime {
-		return uint64(len(time.RFC3339Nano)) * uint64(br.rowsLen)
+		return uint64(len(time.RFC3339Nano)) * uint64(br.rowsLen), nil
 	}
 
 	switch c.valueType {
@@ -2607,12 +2795,16 @@ func (c *blockResultColumn) sumLenValues(br *blockResult) uint64 {
 	case valueTypeDict:
 		n := uint64(0)
 		dictValues := c.dictValues
-		for _, v := range c.getValuesEncoded(br) {
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range valuesEncoded {
 			idx := v[0]
 			v := dictValues[idx]
 			n += uint64(len(v))
 		}
-		return n
+		return n, nil
 	case valueTypeUint8:
 		return c.sumLenStringValues(br)
 	case valueTypeUint16:
@@ -2628,32 +2820,36 @@ func (c *blockResultColumn) sumLenValues(br *blockResult) uint64 {
 	case valueTypeIPv4:
 		return c.sumLenStringValues(br)
 	case valueTypeTimestampISO8601:
-		return uint64(len(iso8601Timestamp)) * uint64(br.rowsLen)
+		return uint64(len(iso8601Timestamp)) * uint64(br.rowsLen), nil
 	default:
 		logger.Panicf("BUG: unknown valueType=%d", c.valueType)
-		return 0
+		return 0, nil
 	}
 }
 
-func (c *blockResultColumn) sumLenStringValues(br *blockResult) uint64 {
+func (c *blockResultColumn) sumLenStringValues(br *blockResult) (uint64, error) {
 	n := uint64(0)
-	for _, v := range c.getValues(br) {
+	values, err := c.getValues(br)
+	if err != nil {
+		return 0, err
+	}
+	for _, v := range values {
 		n += uint64(len(v))
 	}
-	return n
+	return n, nil
 }
 
-func (c *blockResultColumn) sumValues(br *blockResult) (float64, int) {
+func (c *blockResultColumn) sumValues(br *blockResult) (float64, int, error) {
 	if c.isConst {
 		v := c.valuesEncoded[0]
 		f, ok := tryParseFloat64(v)
 		if !ok {
-			return 0, 0
+			return 0, 0, nil
 		}
-		return f * float64(br.rowsLen), br.rowsLen
+		return f * float64(br.rowsLen), br.rowsLen, nil
 	}
 	if c.isTime {
-		return 0, 0
+		return 0, 0, nil
 	}
 
 	switch c.valueType {
@@ -2662,7 +2858,10 @@ func (c *blockResultColumn) sumValues(br *blockResult) (float64, int) {
 		count := 0
 		f := float64(0)
 		ok := false
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, 0, err
+		}
 		for i := range values {
 			if i == 0 || values[i-1] != values[i] {
 				f, ok = tryParseNumber(values[i])
@@ -2672,10 +2871,11 @@ func (c *blockResultColumn) sumValues(br *blockResult) (float64, int) {
 				count++
 			}
 		}
-		return sum, count
+		return sum, count, nil
 	case valueTypeDict:
 		dictValues := c.dictValues
 		a := encoding.GetFloat64s(len(dictValues))
+		defer encoding.PutFloat64s(a)
 		dictValuesFloat := a.A
 		for i, v := range dictValues {
 			f, ok := tryParseNumber(v)
@@ -2686,7 +2886,11 @@ func (c *blockResultColumn) sumValues(br *blockResult) (float64, int) {
 		}
 		sum := float64(0)
 		count := 0
-		for _, v := range c.getValuesEncoded(br) {
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, 0, err
+		}
+		for _, v := range valuesEncoded {
 			dictIdx := v[0]
 			f := dictValuesFloat[dictIdx]
 			if !math.IsNaN(f) {
@@ -2694,54 +2898,77 @@ func (c *blockResultColumn) sumValues(br *blockResult) (float64, int) {
 				count++
 			}
 		}
-		encoding.PutFloat64s(a)
-		return sum, count
+		return sum, count, nil
 	case valueTypeUint8:
 		sum := uint64(0)
-		for _, v := range c.getValuesEncoded(br) {
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, 0, err
+		}
+		for _, v := range valuesEncoded {
 			sum += uint64(unmarshalUint8(v))
 		}
-		return float64(sum), br.rowsLen
+		return float64(sum), br.rowsLen, nil
 	case valueTypeUint16:
 		sum := uint64(0)
-		for _, v := range c.getValuesEncoded(br) {
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, 0, err
+		}
+		for _, v := range valuesEncoded {
 			sum += uint64(unmarshalUint16(v))
 		}
-		return float64(sum), br.rowsLen
+		return float64(sum), br.rowsLen, nil
 	case valueTypeUint32:
 		sum := uint64(0)
-		for _, v := range c.getValuesEncoded(br) {
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, 0, err
+		}
+		for _, v := range valuesEncoded {
 			sum += uint64(unmarshalUint32(v))
 		}
-		return float64(sum), br.rowsLen
+		return float64(sum), br.rowsLen, nil
 	case valueTypeUint64:
 		sum := float64(0)
-		for _, v := range c.getValuesEncoded(br) {
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, 0, err
+		}
+		for _, v := range valuesEncoded {
 			sum += float64(unmarshalUint64(v))
 		}
-		return sum, br.rowsLen
+		return sum, br.rowsLen, nil
 	case valueTypeInt64:
 		sum := float64(0)
-		for _, v := range c.getValuesEncoded(br) {
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, 0, err
+		}
+		for _, v := range valuesEncoded {
 			sum += float64(unmarshalInt64(v))
 		}
-		return sum, br.rowsLen
+		return sum, br.rowsLen, nil
 	case valueTypeFloat64:
 		sum := float64(0)
-		for _, v := range c.getValuesEncoded(br) {
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return 0, 0, err
+		}
+		for _, v := range valuesEncoded {
 			f := unmarshalFloat64(v)
 			if !math.IsNaN(f) {
 				sum += f
 			}
 		}
-		return sum, br.rowsLen
+		return sum, br.rowsLen, nil
 	case valueTypeIPv4:
-		return 0, 0
+		return 0, 0, nil
 	case valueTypeTimestampISO8601:
-		return 0, 0
+		return 0, 0, nil
 	default:
 		logger.Panicf("BUG: unknown valueType=%d", c.valueType)
-		return 0, 0
+		return 0, 0, nil
 	}
 }
 
@@ -2812,16 +3039,19 @@ func getEmptyStrings(rowsLen int) []string {
 
 var emptyStrings atomic.Pointer[[]string]
 
-func visitValuesReadonly(bs *blockSearch, ch *columnHeader, bm *bitmap, f func(values []string)) {
+func visitValuesReadonly(bs *blockSearch, ch *columnHeader, bm *bitmap, f func(values []string)) error {
 	if bm.isZero() {
 		// Fast path - nothing to visit
-		return
+		return nil
 	}
-	values := bs.getValuesForColumn(ch)
+	values, err := bs.getValuesForColumn(ch)
+	if err != nil {
+		return err
+	}
 	if bm.areAllBitsSet() {
 		// Faster path - visit all the values
 		f(values)
-		return
+		return nil
 	}
 
 	// Slower path - visit only the selected values
@@ -2831,6 +3061,7 @@ func visitValuesReadonly(bs *blockSearch, ch *columnHeader, bm *bitmap, f func(v
 	})
 	f(vb.values)
 	putValuesBuf(vb)
+	return nil
 }
 
 type valuesBuf struct {

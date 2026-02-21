@@ -673,7 +673,7 @@ func TestStorageRunQuery(t *testing.T) {
 	t.Run("tenant_ids", func(t *testing.T) {
 		tenantIDs, err := s.GetTenantIDs(context.TODO(), 0, time.Now().UnixNano())
 		if err != nil {
-			t.Fatalf("unexpected error: %s", err)
+			t.Fatalf("unexpected GetTenantIDs error: %s", err)
 		}
 		sort.Slice(tenantIDs, func(i, j int) bool {
 			return tenantIDs[i].less(&tenantIDs[j])
@@ -1241,11 +1241,16 @@ func TestStorageSearch(t *testing.T) {
 		maxTimestamp := baseTimestamp + rowsPerBlock*1e9 + blocksPerStream
 		f := getBaseFilter(minTimestamp, maxTimestamp, nil)
 		sso := newTestStorageSearchOptions([]TenantID{tenantID}, f, []string{"_msg"})
-		qs := &QueryStats{}
 		processBlock := func(_ uint, _ *blockResult) {
 			panic(fmt.Errorf("unexpected match"))
 		}
-		s.searchParallel(workersCount, sso, qs, nil, processBlock)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		qctx := &QueryContext{
+			Context:    ctx,
+			cancel:     cancel,
+			QueryStats: &QueryStats{},
+		}
+		s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 	})
 	t.Run("missing-tenant-bigger-than-existing", func(_ *testing.T) {
 		tenantID := TenantID{
@@ -1256,11 +1261,16 @@ func TestStorageSearch(t *testing.T) {
 		maxTimestamp := baseTimestamp + rowsPerBlock*1e9 + blocksPerStream
 		f := getBaseFilter(minTimestamp, maxTimestamp, nil)
 		sso := newTestStorageSearchOptions([]TenantID{tenantID}, f, []string{"_msg"})
-		qs := &QueryStats{}
 		processBlock := func(_ uint, _ *blockResult) {
 			panic(fmt.Errorf("unexpected match"))
 		}
-		s.searchParallel(workersCount, sso, qs, nil, processBlock)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		qctx := &QueryContext{
+			Context:    ctx,
+			cancel:     cancel,
+			QueryStats: &QueryStats{},
+		}
+		s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 	})
 	t.Run("missing-tenant-middle", func(_ *testing.T) {
 		tenantID := TenantID{
@@ -1271,11 +1281,16 @@ func TestStorageSearch(t *testing.T) {
 		maxTimestamp := baseTimestamp + rowsPerBlock*1e9 + blocksPerStream
 		f := getBaseFilter(minTimestamp, maxTimestamp, nil)
 		sso := newTestStorageSearchOptions([]TenantID{tenantID}, f, []string{"_msg"})
-		qs := &QueryStats{}
 		processBlock := func(_ uint, _ *blockResult) {
 			panic(fmt.Errorf("unexpected match"))
 		}
-		s.searchParallel(workersCount, sso, qs, nil, processBlock)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		qctx := &QueryContext{
+			Context:    ctx,
+			cancel:     cancel,
+			QueryStats: &QueryStats{},
+		}
+		s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 	})
 	t.Run("matching-tenant-id", func(t *testing.T) {
 		for i := range tenantsCount {
@@ -1287,12 +1302,17 @@ func TestStorageSearch(t *testing.T) {
 			maxTimestamp := baseTimestamp + rowsPerBlock*1e9 + blocksPerStream
 			f := getBaseFilter(minTimestamp, maxTimestamp, nil)
 			sso := newTestStorageSearchOptions([]TenantID{tenantID}, f, []string{"_msg"})
-			qs := &QueryStats{}
 			var rowsCountTotal atomic.Uint32
 			processBlock := func(_ uint, br *blockResult) {
 				rowsCountTotal.Add(uint32(br.rowsLen))
 			}
-			s.searchParallel(workersCount, sso, qs, nil, processBlock)
+			ctx, cancel := context.WithCancelCause(context.Background())
+			qctx := &QueryContext{
+				Context:    ctx,
+				cancel:     cancel,
+				QueryStats: &QueryStats{},
+			}
+			s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 
 			expectedRowsCount := streamsPerTenant * blocksPerStream * rowsPerBlock
 			if n := rowsCountTotal.Load(); n != uint32(expectedRowsCount) {
@@ -1305,12 +1325,17 @@ func TestStorageSearch(t *testing.T) {
 		maxTimestamp := baseTimestamp + rowsPerBlock*1e9 + blocksPerStream
 		f := getBaseFilter(minTimestamp, maxTimestamp, nil)
 		sso := newTestStorageSearchOptions(allTenantIDs, f, []string{"_msg"})
-		qs := &QueryStats{}
 		var rowsCountTotal atomic.Uint32
 		processBlock := func(_ uint, br *blockResult) {
 			rowsCountTotal.Add(uint32(br.rowsLen))
 		}
-		s.searchParallel(workersCount, sso, qs, nil, processBlock)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		qctx := &QueryContext{
+			Context:    ctx,
+			cancel:     cancel,
+			QueryStats: &QueryStats{},
+		}
+		s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 
 		expectedRowsCount := tenantsCount * streamsPerTenant * blocksPerStream * rowsPerBlock
 		if n := rowsCountTotal.Load(); n != uint32(expectedRowsCount) {
@@ -1323,11 +1348,16 @@ func TestStorageSearch(t *testing.T) {
 		maxTimestamp := baseTimestamp + rowsPerBlock*1e9 + blocksPerStream
 		f := getBaseFilter(minTimestamp, maxTimestamp, sf)
 		sso := newTestStorageSearchOptions(allTenantIDs, f, []string{"_msg"})
-		qs := &QueryStats{}
 		processBlock := func(_ uint, _ *blockResult) {
 			panic(fmt.Errorf("unexpected match"))
 		}
-		s.searchParallel(workersCount, sso, qs, nil, processBlock)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		qctx := &QueryContext{
+			Context:    ctx,
+			cancel:     cancel,
+			QueryStats: &QueryStats{},
+		}
+		s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 	})
 	t.Run("matching-stream-id", func(t *testing.T) {
 		for i := range streamsPerTenant {
@@ -1340,12 +1370,17 @@ func TestStorageSearch(t *testing.T) {
 			maxTimestamp := baseTimestamp + rowsPerBlock*1e9 + blocksPerStream
 			f := getBaseFilter(minTimestamp, maxTimestamp, sf)
 			sso := newTestStorageSearchOptions([]TenantID{tenantID}, f, []string{"_msg"})
-			qs := &QueryStats{}
 			var rowsCountTotal atomic.Uint32
 			processBlock := func(_ uint, br *blockResult) {
 				rowsCountTotal.Add(uint32(br.rowsLen))
 			}
-			s.searchParallel(workersCount, sso, qs, nil, processBlock)
+			ctx, cancel := context.WithCancelCause(context.Background())
+			qctx := &QueryContext{
+				Context:    ctx,
+				cancel:     cancel,
+				QueryStats: &QueryStats{},
+			}
+			s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 
 			expectedRowsCount := blocksPerStream * rowsPerBlock
 			if n := rowsCountTotal.Load(); n != uint32(expectedRowsCount) {
@@ -1363,12 +1398,17 @@ func TestStorageSearch(t *testing.T) {
 		maxTimestamp := baseTimestamp + rowsPerBlock*1e9 + blocksPerStream
 		f := getBaseFilter(minTimestamp, maxTimestamp, sf)
 		sso := newTestStorageSearchOptions([]TenantID{tenantID}, f, []string{"_msg"})
-		qs := &QueryStats{}
 		var rowsCountTotal atomic.Uint32
 		processBlock := func(_ uint, br *blockResult) {
 			rowsCountTotal.Add(uint32(br.rowsLen))
 		}
-		s.searchParallel(workersCount, sso, qs, nil, processBlock)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		qctx := &QueryContext{
+			Context:    ctx,
+			cancel:     cancel,
+			QueryStats: &QueryStats{},
+		}
+		s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 
 		expectedRowsCount := streamsPerTenant * blocksPerStream * rowsPerBlock
 		if n := rowsCountTotal.Load(); n != uint32(expectedRowsCount) {
@@ -1389,12 +1429,17 @@ func TestStorageSearch(t *testing.T) {
 			newFilterRegexp("_msg", mustCompileRegex("message [02] at ")),
 		})
 		sso := newTestStorageSearchOptions([]TenantID{tenantID}, f, []string{"_msg"})
-		qs := &QueryStats{}
 		var rowsCountTotal atomic.Uint32
 		processBlock := func(_ uint, br *blockResult) {
 			rowsCountTotal.Add(uint32(br.rowsLen))
 		}
-		s.searchParallel(workersCount, sso, qs, nil, processBlock)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		qctx := &QueryContext{
+			Context:    ctx,
+			cancel:     cancel,
+			QueryStats: &QueryStats{},
+		}
+		s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 
 		expectedRowsCount := streamsPerTenant * blocksPerStream * 2
 		if n := rowsCountTotal.Load(); n != uint32(expectedRowsCount) {
@@ -1411,12 +1456,17 @@ func TestStorageSearch(t *testing.T) {
 		maxTimestamp := baseTimestamp + (rowsPerBlock-1)*1e9 - 1
 		f := getBaseFilter(minTimestamp, maxTimestamp, sf)
 		sso := newTestStorageSearchOptions([]TenantID{tenantID}, f, []string{"_msg"})
-		qs := &QueryStats{}
 		var rowsCountTotal atomic.Uint32
 		processBlock := func(_ uint, br *blockResult) {
 			rowsCountTotal.Add(uint32(br.rowsLen))
 		}
-		s.searchParallel(workersCount, sso, qs, nil, processBlock)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		qctx := &QueryContext{
+			Context:    ctx,
+			cancel:     cancel,
+			QueryStats: &QueryStats{},
+		}
+		s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 
 		expectedRowsCount := blocksPerStream
 		if n := rowsCountTotal.Load(); n != uint32(expectedRowsCount) {
@@ -1433,11 +1483,16 @@ func TestStorageSearch(t *testing.T) {
 		maxTimestamp := baseTimestamp + (rowsPerBlock+2)*1e9
 		f := getBaseFilter(minTimestamp, maxTimestamp, sf)
 		sso := newTestStorageSearchOptions([]TenantID{tenantID}, f, []string{"_msg"})
-		qs := &QueryStats{}
 		processBlock := func(_ uint, _ *blockResult) {
 			panic(fmt.Errorf("unexpected match"))
 		}
-		s.searchParallel(workersCount, sso, qs, nil, processBlock)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		qctx := &QueryContext{
+			Context:    ctx,
+			cancel:     cancel,
+			QueryStats: &QueryStats{},
+		}
+		s.searchParallel(workersCount, qctx, sso, nil, processBlock)
 	})
 
 	s.MustClose()
@@ -1711,5 +1766,6 @@ func storeRowsForSearchHiddenFieldsFilters(s *Storage, tenantIDs []TenantID, now
 
 func newTestQueryContext(tenantIDs []TenantID, q *Query) *QueryContext {
 	qs := &QueryStats{}
-	return NewQueryContext(context.Background(), qs, tenantIDs, q, false, nil)
+	cancel := func(_ error) {}
+	return NewQueryContext(context.Background(), cancel, qs, tenantIDs, q, false, nil)
 }

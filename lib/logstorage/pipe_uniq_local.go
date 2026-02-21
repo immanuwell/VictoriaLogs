@@ -66,10 +66,11 @@ func (pu *pipeUniqLocal) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pu *pipeUniqLocal) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pu *pipeUniqLocal) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeUniqLocalProcessor{
 		pu:     pu,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -78,6 +79,7 @@ type pipeUniqLocalProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeUniqLocalProcessorShard]
+	cancel func(error)
 }
 
 type pipeUniqLocalProcessorShard struct {
@@ -92,9 +94,17 @@ func (pup *pipeUniqLocalProcessor) writeBlock(workerID uint, br *blockResult) {
 		logger.Panicf("BUG: expecting non-empty hitsFieldName; pu=%#v", pu)
 	}
 
-	columnValuess := getColumnValuess(br, pu.byFields)
+	columnValuess, err := getColumnValuess(br, pu.byFields)
+	if err != nil {
+		pup.cancel(err)
+		return
+	}
 	cHits := br.getColumnByName(pu.hitsFieldName)
-	hits := cHits.getValues(br)
+	hits, err := cHits.getValues(br)
+	if err != nil {
+		pup.cancel(err)
+		return
+	}
 
 	var buf []byte
 	for rowIdx := range br.rowsLen {
@@ -115,29 +125,37 @@ func (pup *pipeUniqLocalProcessor) writeBlock(workerID uint, br *blockResult) {
 	}
 }
 
-func getColumnValuess(br *blockResult, fields []string) [][]string {
+func getColumnValuess(br *blockResult, fields []string) ([][]string, error) {
 	if len(fields) == 0 {
 		cs := br.getColumns()
 		columnValuess := make([][]string, len(cs))
 		for i, c := range cs {
-			columnValuess[i] = c.getValues(br)
+			var err error
+			columnValuess[i], err = c.getValues(br)
+			if err != nil {
+				return nil, err
+			}
 		}
-		return columnValuess
+		return columnValuess, nil
 	}
 
 	columnValuess := make([][]string, len(fields))
 	for i, field := range fields {
 		c := br.getColumnByName(field)
-		columnValuess[i] = c.getValues(br)
+		var err error
+		columnValuess[i], err = c.getValues(br)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return columnValuess
+	return columnValuess, nil
 }
 
-func (pup *pipeUniqLocalProcessor) flush() error {
+func (pup *pipeUniqLocalProcessor) flush() {
 	pu := pup.pu.pu
 	shards := pup.shards.All()
 	if len(shards) == 0 {
-		return nil
+		return
 	}
 
 	a := make([][]ValueWithHits, len(shards))
@@ -171,8 +189,6 @@ func (pup *pipeUniqLocalProcessor) flush() error {
 		wctx.writeRow(rowValues)
 	}
 	wctx.flush()
-
-	return nil
 }
 
 type pipeFixedFieldsWriteContext struct {

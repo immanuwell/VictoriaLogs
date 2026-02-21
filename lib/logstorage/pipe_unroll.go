@@ -74,10 +74,11 @@ func (pu *pipeUnroll) updateNeededFields(pf *prefixfilter.Filter) {
 	pf.AddAllowFilters(pu.fields)
 }
 
-func (pu *pipeUnroll) newPipeProcessor(_ int, stopCh <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pu *pipeUnroll) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeUnrollProcessor{
 		pu:     pu,
 		stopCh: stopCh,
+		cancel: cancel,
 		ppNext: ppNext,
 	}
 }
@@ -86,6 +87,7 @@ type pipeUnrollProcessor struct {
 	pu     *pipeUnroll
 	stopCh <-chan struct{}
 	ppNext pipeProcessor
+	cancel func(error)
 
 	shards atomicutil.Slice[pipeUnrollProcessorShard]
 }
@@ -111,11 +113,20 @@ func (pup *pipeUnrollProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard := pup.shards.Get(workerID)
 	shard.wctx.init(workerID, pup.ppNext, false, false, br)
 
+	defer func() {
+		shard.wctx.flush()
+		shard.wctx.reset()
+		shard.a.reset()
+	}()
+
 	bm := &shard.bm
 	if iff := pu.iff; iff != nil {
 		bm.init(br.rowsLen)
 		bm.setBits()
-		iff.f.applyToBlockResult(br, bm)
+		if err := iff.f.applyToBlockResult(br, bm); err != nil {
+			pup.cancel(err)
+			return
+		}
 		if bm.isZero() {
 			pup.ppNext.writeBlock(workerID, br)
 			return
@@ -126,36 +137,41 @@ func (pup *pipeUnrollProcessor) writeBlock(workerID uint, br *blockResult) {
 	columnValues := shard.columnValues
 	for i, f := range pu.fields {
 		c := br.getColumnByName(f)
-		columnValues[i] = c.getValues(br)
+		var err error
+		columnValues[i], err = c.getValues(br)
+		if err != nil {
+			pup.cancel(err)
+			return
+		}
 	}
 
-	fields := shard.fields
 	for rowIdx := range br.rowsLen {
 		if needStop(pup.stopCh) {
 			return
 		}
 		if pu.iff == nil || bm.isSetBit(rowIdx) {
-			shard.writeUnrolledFields(pu.fields, columnValues, rowIdx)
+			if err := shard.writeUnrolledFields(pu.fields, columnValues, rowIdx); err != nil {
+				pup.cancel(err)
+				return
+			}
 		} else {
-			fields = fields[:0]
+			shard.fields = shard.fields[:0]
 			for i, f := range pu.fields {
 				v := columnValues[i][rowIdx]
-				fields = append(fields, Field{
+				shard.fields = append(shard.fields, Field{
 					Name:  f,
 					Value: v,
 				})
 			}
-			shard.wctx.writeRow(rowIdx, fields)
+			if err := shard.wctx.writeRow(rowIdx, shard.fields); err != nil {
+				pup.cancel(err)
+				return
+			}
 		}
 	}
-	shard.fields = fields
-
-	shard.wctx.flush()
-	shard.wctx.reset()
-	shard.a.reset()
 }
 
-func (shard *pipeUnrollProcessorShard) writeUnrolledFields(fieldNames []string, columnValues [][]string, rowIdx int) {
+func (shard *pipeUnrollProcessorShard) writeUnrolledFields(fieldNames []string, columnValues [][]string, rowIdx int) error {
 	// unroll values at rowIdx row
 
 	shard.unrolledValues = slicesutil.SetLength(shard.unrolledValues, len(columnValues))
@@ -183,27 +199,26 @@ func (shard *pipeUnrollProcessorShard) writeUnrolledFields(fieldNames []string, 
 	}
 
 	// write unrolled values to the next pipe.
-	fields := shard.fields
 	for unrollIdx := range rows {
-		fields = fields[:0]
+		shard.fields = shard.fields[:0]
 		for i, values := range unrolledValues {
 			v := ""
 			if unrollIdx < len(values) {
 				v = values[unrollIdx]
 			}
-			fields = append(fields, Field{
+			shard.fields = append(shard.fields, Field{
 				Name:  fieldNames[i],
 				Value: v,
 			})
 		}
-		shard.wctx.writeRow(rowIdx, fields)
+		if err := shard.wctx.writeRow(rowIdx, shard.fields); err != nil {
+			return err
+		}
 	}
-	shard.fields = fields
-}
-
-func (pup *pipeUnrollProcessor) flush() error {
 	return nil
 }
+
+func (pup *pipeUnrollProcessor) flush() {}
 
 func parsePipeUnroll(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("unroll") {

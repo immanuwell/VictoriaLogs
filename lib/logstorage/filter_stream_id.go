@@ -78,12 +78,12 @@ func (fs *filterStreamID) matchRow(fields []Field) bool {
 	return ok
 }
 
-func (fs *filterStreamID) applyToBlockResult(br *blockResult, bm *bitmap) {
+func (fs *filterStreamID) applyToBlockResult(br *blockResult, bm *bitmap) error {
 	m := fs.getStreamIDsMap()
 
 	if len(m) == 0 {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	c := br.getColumnByName("_stream_id")
@@ -92,16 +92,19 @@ func (fs *filterStreamID) applyToBlockResult(br *blockResult, bm *bitmap) {
 		if _, ok := m[v]; !ok {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 	if c.isTime {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return nil
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := values[idx]
 			_, ok := m[v]
@@ -109,6 +112,7 @@ func (fs *filterStreamID) applyToBlockResult(br *blockResult, bm *bitmap) {
 		})
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range c.dictValues {
 			ch := byte(0)
 			_, ok := m[v]
@@ -117,12 +121,14 @@ func (fs *filterStreamID) applyToBlockResult(br *blockResult, bm *bitmap) {
 			}
 			bb.B = append(bb.B, ch)
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			n := valuesEncoded[idx][0]
 			return bb.B[n] == 1
 		})
-		bbPool.Put(bb)
 	case valueTypeUint8:
 		bm.resetBits()
 	case valueTypeUint16:
@@ -142,13 +148,14 @@ func (fs *filterStreamID) applyToBlockResult(br *blockResult, bm *bitmap) {
 	default:
 		logger.Panicf("FATAL: unknown valueType=%d", c.valueType)
 	}
+	return nil
 }
 
-func (fs *filterStreamID) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
+func (fs *filterStreamID) applyToBlockSearch(bs *blockSearch, bm *bitmap) error {
 	m := fs.getStreamIDsMap()
 	if len(m) == 0 {
 		bm.resetBits()
-		return
+		return nil
 	}
 
 	bb := bbPool.Get()
@@ -158,6 +165,6 @@ func (fs *filterStreamID) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
 
 	if !ok {
 		bm.resetBits()
-		return
 	}
+	return nil
 }

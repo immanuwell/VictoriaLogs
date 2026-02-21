@@ -103,7 +103,7 @@ func (pf *pipeFacets) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pf *pipeFacets) newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (pf *pipeFacets) newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	maxStateSize := int64(float64(memory.Allowed()) * 0.2)
 
 	pfp := &pipeFacetsProcessor{
@@ -127,7 +127,7 @@ type pipeFacetsProcessor struct {
 	pf          *pipeFacets
 	concurrency int
 	stopCh      <-chan struct{}
-	cancel      func()
+	cancel      func(error)
 	ppNext      pipeProcessor
 
 	shards atomicutil.Slice[pipeFacetsProcessorShard]
@@ -168,69 +168,91 @@ func (fhs *pipeFacetsFieldHits) enableIgnoreField() {
 func (shard *pipeFacetsProcessorShard) writeBlock(br *blockResult) {
 	cs := br.getColumns()
 	for _, c := range cs {
-		shard.updateFacetsForColumn(br, c)
+		if err := shard.updateFacetsForColumn(br, c); err != nil {
+			shard.pfp.cancel(err)
+			return
+		}
 	}
 	shard.rowsTotal += uint64(br.rowsLen)
 }
 
-func (shard *pipeFacetsProcessorShard) updateFacetsForColumn(br *blockResult, c *blockResultColumn) {
+func (shard *pipeFacetsProcessorShard) updateFacetsForColumn(br *blockResult, c *blockResultColumn) error {
 	fhs := shard.getFieldHits(c.name)
 	if fhs.mustIgnore {
-		return
+		return nil
 	}
 	if fhs.m.entriesCount() > shard.pfp.pf.maxValuesPerField {
 		// Ignore fields with too many unique values
 		fhs.enableIgnoreField()
-		return
+		return nil
 	}
 
 	if c.isConst {
 		v := c.valuesEncoded[0]
 		shard.updateStateGeneric(fhs, v, uint64(br.rowsLen))
-		return
+		return nil
 	}
 
 	switch c.valueType {
 	case valueTypeDict:
-		c.forEachDictValueWithHits(br, func(v string, hits uint64) {
+		return c.forEachDictValueWithHits(br, func(v string, hits uint64) {
 			shard.updateStateGeneric(fhs, v, hits)
 		})
 	case valueTypeUint8:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalUint8(v)
 			shard.updateStateUint64(fhs, uint64(n))
 		}
 	case valueTypeUint16:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalUint16(v)
 			shard.updateStateUint64(fhs, uint64(n))
 		}
 	case valueTypeUint32:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalUint32(v)
 			shard.updateStateUint64(fhs, uint64(n))
 		}
 	case valueTypeUint64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalUint64(v)
 			shard.updateStateUint64(fhs, n)
 		}
 	case valueTypeInt64:
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for _, v := range values {
 			n := unmarshalInt64(v)
 			shard.updateStateInt64(fhs, n)
 		}
 	default:
 		for i := range br.rowsLen {
-			v := c.getValueAtRow(br, i)
+			v, err := c.getValueAtRow(br, i)
+			if err != nil {
+				return err
+			}
 			shard.updateStateGeneric(fhs, v, 1)
 		}
 	}
+	return nil
 }
 
 func (shard *pipeFacetsProcessorShard) updateStateInt64(fhs *pipeFacetsFieldHits, n int64) {
@@ -340,7 +362,7 @@ func (pfp *pipeFacetsProcessor) writeBlock(workerID uint, br *blockResult) {
 			// The state size is too big. Stop processing data in order to avoid OOM crash.
 			if remaining+stateSizeBudgetChunk >= 0 {
 				// Notify worker goroutines to stop calling writeBlock() in order to save CPU time.
-				pfp.cancel()
+				pfp.cancel(nil)
 			}
 			return
 		}
@@ -350,15 +372,16 @@ func (pfp *pipeFacetsProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.writeBlock(br)
 }
 
-func (pfp *pipeFacetsProcessor) flush() error {
+func (pfp *pipeFacetsProcessor) flush() {
 	if n := pfp.stateSizeBudget.Load(); n <= 0 {
-		return fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", pfp.pf.String(), pfp.maxStateSize/(1<<20))
+		pfp.cancel(fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", pfp.pf.String(), pfp.maxStateSize/(1<<20)))
+		return
 	}
 
 	// merge state across shards
 	shards := pfp.shards.All()
 	if len(shards) == 0 {
-		return nil
+		return
 	}
 
 	ignoreFields := make(map[string]bool)
@@ -366,7 +389,7 @@ func (pfp *pipeFacetsProcessor) flush() error {
 	rowsTotal := uint64(0)
 	for _, shard := range shards {
 		if needStop(pfp.stopCh) {
-			return nil
+			return
 		}
 		for fieldName, fhs := range shard.m {
 			if ignoreFields[fieldName] {
@@ -396,7 +419,7 @@ func (pfp *pipeFacetsProcessor) flush() error {
 	limit := pfp.pf.limit
 	for _, fieldName := range fieldNames {
 		if needStop(pfp.stopCh) {
-			return nil
+			return
 		}
 
 		hmas := hmasByFieldName[fieldName]
@@ -433,14 +456,12 @@ func (pfp *pipeFacetsProcessor) flush() error {
 		}
 		for _, v := range vs {
 			if needStop(pfp.stopCh) {
-				return nil
+				return
 			}
 			wctx.writeRow(fieldName, v.k, v.hits)
 		}
 	}
 	wctx.flush()
-
-	return nil
 }
 
 func appendTopEntryFacets(dst []pipeTopEntry, hm *hitsMap) []pipeTopEntry {

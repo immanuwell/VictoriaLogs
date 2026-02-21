@@ -52,9 +52,10 @@ func (ps *pipeBlockStats) updateNeededFields(pf *prefixfilter.Filter) {
 	pf.AddAllowFilter("*")
 }
 
-func (ps *pipeBlockStats) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (ps *pipeBlockStats) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeBlockStatsProcessor{
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -62,6 +63,7 @@ type pipeBlockStatsProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeBlockStatsProcessorShard]
+	cancel func(error)
 }
 
 type pipeBlockStatsProcessorShard struct {
@@ -103,7 +105,11 @@ func (psp *pipeBlockStatsProcessor) writeBlock(workerID uint, br *blockResult) {
 		}
 
 		typ := c.valueType.String()
-		ch := br.bs.getColumnHeader(c.name)
+		ch, err := br.bs.getColumnHeader(c.name)
+		if err != nil {
+			psp.cancel(err)
+			return
+		}
 		dictSize := 0
 		dictItemsCount := len(ch.valuesDict.values)
 		if c.valueType == valueTypeDict {
@@ -118,9 +124,7 @@ func (psp *pipeBlockStatsProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard.wctx.reset()
 }
 
-func (psp *pipeBlockStatsProcessor) flush() error {
-	return nil
-}
+func (psp *pipeBlockStatsProcessor) flush() {}
 
 func parsePipeBlockStats(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("block_stats") {

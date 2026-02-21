@@ -162,25 +162,25 @@ func (fp *filterPatternMatch) matchRowByField(fields []Field, fieldName string) 
 	return fp.pm.Match(v)
 }
 
-func (fp *filterPatternMatch) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) {
+func (fp *filterPatternMatch) applyToBlockResultByField(br *blockResult, bm *bitmap, fieldName string) error {
 	c := br.getColumnByName(fieldName)
 	if c.isConst {
 		v := c.valuesEncoded[0]
 		if !fp.pm.Match(v) {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 	if c.isTime {
-		fp.matchColumnGeneric(br, bm, c)
-		return
+		return fp.matchColumnGeneric(br, bm, c)
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		fp.matchColumnGeneric(br, bm, c)
+		return fp.matchColumnGeneric(br, bm, c)
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range c.dictValues {
 			c := byte(0)
 			if fp.pm.Match(v) {
@@ -188,73 +188,82 @@ func (fp *filterPatternMatch) applyToBlockResultByField(br *blockResult, bm *bit
 			}
 			bb.B = append(bb.B, c)
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			n := valuesEncoded[idx][0]
 			return bb.B[n] == 1
 		})
-		bbPool.Put(bb)
 	case valueTypeUint8:
-		fp.matchColumnGeneric(br, bm, c)
+		return fp.matchColumnGeneric(br, bm, c)
 	case valueTypeUint16:
-		fp.matchColumnGeneric(br, bm, c)
+		return fp.matchColumnGeneric(br, bm, c)
 	case valueTypeUint32:
-		fp.matchColumnGeneric(br, bm, c)
+		return fp.matchColumnGeneric(br, bm, c)
 	case valueTypeUint64:
-		fp.matchColumnGeneric(br, bm, c)
+		return fp.matchColumnGeneric(br, bm, c)
 	case valueTypeInt64:
-		fp.matchColumnGeneric(br, bm, c)
+		return fp.matchColumnGeneric(br, bm, c)
 	case valueTypeFloat64:
-		fp.matchColumnGeneric(br, bm, c)
+		return fp.matchColumnGeneric(br, bm, c)
 	case valueTypeIPv4:
-		fp.matchColumnGeneric(br, bm, c)
+		return fp.matchColumnGeneric(br, bm, c)
 	case valueTypeTimestampISO8601:
-		fp.matchColumnGeneric(br, bm, c)
+		return fp.matchColumnGeneric(br, bm, c)
 	default:
 		logger.Panicf("FATAL: unknown valueType=%d", c.valueType)
 	}
+	return nil
 }
 
-func (fp *filterPatternMatch) matchColumnGeneric(br *blockResult, bm *bitmap, c *blockResultColumn) {
-	values := c.getValues(br)
+func (fp *filterPatternMatch) matchColumnGeneric(br *blockResult, bm *bitmap, c *blockResultColumn) error {
+	values, err := c.getValues(br)
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		return fp.pm.Match(values[idx])
 	})
+	return nil
 }
 
-func (fp *filterPatternMatch) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) {
+func (fp *filterPatternMatch) applyToBlockSearchByField(bs *blockSearch, bm *bitmap, fieldName string) error {
 	// Verify whether fp matches const column
-	v := bs.getConstColumnValue(fieldName)
-	if v != "" {
+	v, err := bs.getConstColumnValue(fieldName)
+	if err != nil || v != "" {
 		if !fp.pm.Match(v) {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	// Verify whether fp matches other columns
-	ch := bs.getColumnHeader(fieldName)
-	if ch == nil {
+	ch, err := bs.getColumnHeader(fieldName)
+	if err != nil || ch == nil {
 		// Fast path - there are no matching columns.
 		if !fp.pm.Match("") {
 			bm.resetBits()
 		}
-		return
+		return err
 	}
 
 	tokens := fp.getTokensHashes()
 
 	switch ch.valueType {
 	case valueTypeString:
-		if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+		if err != nil || !matches {
 			bm.resetBits()
-			return
+			return err
 		}
-		visitValues(bs, ch, bm, func(v string) bool {
+		return visitValues(bs, ch, bm, func(v string) bool {
 			return fp.pm.Match(v)
 		})
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range ch.valuesDict.values {
 			c := byte(0)
 			if fp.pm.Match(v) {
@@ -262,97 +271,105 @@ func (fp *filterPatternMatch) applyToBlockSearchByField(bs *blockSearch, bm *bit
 			}
 			bb.B = append(bb.B, c)
 		}
-		matchEncodedValuesDict(bs, ch, bm, bb.B)
-		bbPool.Put(bb)
+		return matchEncodedValuesDict(bs, ch, bm, bb.B)
 	case valueTypeUint8:
-		if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+		if err != nil || !matches {
 			bm.resetBits()
-			return
+			return err
 		}
 		bb := bbPool.Get()
-		visitValues(bs, ch, bm, func(v string) bool {
+		defer bbPool.Put(bb)
+		return visitValues(bs, ch, bm, func(v string) bool {
 			s := toUint8String(bs, bb, v)
 			return fp.pm.Match(s)
 		})
-		bbPool.Put(bb)
 	case valueTypeUint16:
-		if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+		if err != nil || !matches {
 			bm.resetBits()
-			return
+			return err
 		}
 		bb := bbPool.Get()
-		visitValues(bs, ch, bm, func(v string) bool {
+		defer bbPool.Put(bb)
+		return visitValues(bs, ch, bm, func(v string) bool {
 			s := toUint16String(bs, bb, v)
 			return fp.pm.Match(s)
 		})
-		bbPool.Put(bb)
 	case valueTypeUint32:
-		if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+		if err != nil || !matches {
 			bm.resetBits()
-			return
+			return err
 		}
 		bb := bbPool.Get()
-		visitValues(bs, ch, bm, func(v string) bool {
+		defer bbPool.Put(bb)
+		return visitValues(bs, ch, bm, func(v string) bool {
 			s := toUint32String(bs, bb, v)
 			return fp.pm.Match(s)
 		})
-		bbPool.Put(bb)
 	case valueTypeUint64:
-		if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+		if err != nil || !matches {
 			bm.resetBits()
-			return
+			return err
 		}
 		bb := bbPool.Get()
-		visitValues(bs, ch, bm, func(v string) bool {
+		defer bbPool.Put(bb)
+		return visitValues(bs, ch, bm, func(v string) bool {
 			s := toUint64String(bs, bb, v)
 			return fp.pm.Match(s)
 		})
-		bbPool.Put(bb)
 	case valueTypeInt64:
-		if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+		if err != nil || !matches {
 			bm.resetBits()
-			return
+			return err
 		}
 		bb := bbPool.Get()
-		visitValues(bs, ch, bm, func(v string) bool {
+		defer bbPool.Put(bb)
+		return visitValues(bs, ch, bm, func(v string) bool {
 			s := toInt64String(bs, bb, v)
 			return fp.pm.Match(s)
 		})
-		bbPool.Put(bb)
 	case valueTypeFloat64:
-		if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+		if err != nil || !matches {
 			bm.resetBits()
-			return
+			return err
 		}
 		bb := bbPool.Get()
-		visitValues(bs, ch, bm, func(v string) bool {
+		defer bbPool.Put(bb)
+		return visitValues(bs, ch, bm, func(v string) bool {
 			s := toFloat64String(bs, bb, v)
 			return fp.pm.Match(s)
 		})
-		bbPool.Put(bb)
 	case valueTypeIPv4:
-		if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+		if err != nil || !matches {
 			bm.resetBits()
-			return
+			return err
 		}
 		bb := bbPool.Get()
-		visitValues(bs, ch, bm, func(v string) bool {
+		defer bbPool.Put(bb)
+		return visitValues(bs, ch, bm, func(v string) bool {
 			s := toIPv4String(bs, bb, v)
 			return fp.pm.Match(s)
 		})
-		bbPool.Put(bb)
 	case valueTypeTimestampISO8601:
-		if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		matches, err := matchBloomFilterAllTokens(bs, ch, tokens)
+		if err != nil || !matches {
 			bm.resetBits()
-			return
+			return err
 		}
 		bb := bbPool.Get()
-		visitValues(bs, ch, bm, func(v string) bool {
+		defer bbPool.Put(bb)
+		return visitValues(bs, ch, bm, func(v string) bool {
 			s := toTimestampISO8601String(bs, bb, v)
 			return fp.pm.Match(s)
 		})
-		bbPool.Put(bb)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }

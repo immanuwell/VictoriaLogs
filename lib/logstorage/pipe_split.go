@@ -70,10 +70,11 @@ func (ps *pipeSplit) updateNeededFields(pf *prefixfilter.Filter) {
 	}
 }
 
-func (ps *pipeSplit) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (ps *pipeSplit) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeSplitProcessor{
 		ps:     ps,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -82,6 +83,7 @@ type pipeSplitProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeSplitProcessorShard]
+	cancel func(error)
 }
 
 type pipeSplitProcessorShard struct {
@@ -101,8 +103,18 @@ func (psp *pipeSplitProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard := psp.shards.Get(workerID)
 	shard.wctx.init(workerID, psp.ppNext, false, false, br)
 
+	defer func() {
+		shard.wctx.flush()
+		shard.wctx.reset()
+		shard.a.reset()
+	}()
+
 	c := br.getColumnByName(ps.srcField)
-	values := c.getValues(br)
+	values, err := c.getValues(br)
+	if err != nil {
+		psp.cancel(err)
+		return
+	}
 
 	for rowIdx := range values {
 		if rowIdx == 0 || values[rowIdx] != values[rowIdx-1] {
@@ -114,17 +126,14 @@ func (psp *pipeSplitProcessor) writeBlock(workerID uint, br *blockResult) {
 				Value: bytesutil.ToUnsafeString(shard.a.b[bufLen:]),
 			}
 		}
-		shard.wctx.writeRow(rowIdx, shard.fields[:])
+		if err := shard.wctx.writeRow(rowIdx, shard.fields[:]); err != nil {
+			psp.cancel(err)
+			return
+		}
 	}
-
-	shard.wctx.flush()
-	shard.wctx.reset()
-	shard.a.reset()
 }
 
-func (psp *pipeSplitProcessor) flush() error {
-	return nil
-}
+func (psp *pipeSplitProcessor) flush() {}
 
 func parsePipeSplit(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("split") {

@@ -103,11 +103,12 @@ func (pu *pipeUnion) updateNeededFields(_ *prefixfilter.Filter) {
 	// nothing to do
 }
 
-func (pu *pipeUnion) newPipeProcessor(_ int, stopCh <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pu *pipeUnion) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeUnionProcessor{
 		pu:     pu,
 		stopCh: stopCh,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -115,6 +116,7 @@ type pipeUnionProcessor struct {
 	pu     *pipeUnion
 	stopCh <-chan struct{}
 	ppNext pipeProcessor
+	cancel func(error)
 }
 
 func (pup *pipeUnionProcessor) writeBlock(workerID uint, br *blockResult) {
@@ -124,7 +126,7 @@ func (pup *pipeUnionProcessor) writeBlock(workerID uint, br *blockResult) {
 	pup.ppNext.writeBlock(workerID, br)
 }
 
-func (pup *pipeUnionProcessor) flush() error {
+func (pup *pipeUnionProcessor) flush() {
 	// execute the query to union
 	ctxWithCancel, cancel := contextutil.NewStopChanContext(pup.stopCh)
 	defer cancel()
@@ -133,10 +135,12 @@ func (pup *pipeUnionProcessor) flush() error {
 		var br blockResult
 		br.mustInitFromRows(pup.pu.rows)
 		pup.ppNext.writeBlock(0, &br)
-		return nil
+		return
 	}
 
-	return pup.pu.runQuery(ctxWithCancel, pup.pu.q, pup.ppNext.writeBlock)
+	if err := pup.pu.runQuery(ctxWithCancel, pup.pu.q, pup.ppNext.writeBlock); err != nil {
+		pup.cancel(err)
+	}
 }
 
 func parsePipeUnion(lex *lexer) (pipe, error) {

@@ -63,10 +63,11 @@ func (pf *pipeFieldValuesLocal) visitSubqueries(_ func(q *Query)) {
 	// nothing to do
 }
 
-func (pf *pipeFieldValuesLocal) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pf *pipeFieldValuesLocal) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeFieldValuesLocalProcessor{
 		pf:     pf,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -75,6 +76,7 @@ type pipeFieldValuesLocalProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeFieldValuesLocalProcessorShard]
+	cancel func(error)
 }
 
 type pipeFieldValuesLocalProcessorShard struct {
@@ -90,8 +92,16 @@ func (pfp *pipeFieldValuesLocalProcessor) writeBlock(workerID uint, br *blockRes
 	hitsFieldName := pf.getHitsFieldName()
 	cHits := br.getColumnByName(hitsFieldName)
 
-	values := cValues.getValues(br)
-	hits := cHits.getValues(br)
+	values, err := cValues.getValues(br)
+	if err != nil {
+		pfp.cancel(err)
+		return
+	}
+	hits, err := cHits.getValues(br)
+	if err != nil {
+		pfp.cancel(err)
+		return
+	}
 
 	for i, value := range values {
 		hits64, ok := tryParseUint64(hits[i])
@@ -105,11 +115,11 @@ func (pfp *pipeFieldValuesLocalProcessor) writeBlock(workerID uint, br *blockRes
 	}
 }
 
-func (pfp *pipeFieldValuesLocalProcessor) flush() error {
+func (pfp *pipeFieldValuesLocalProcessor) flush() {
 	pf := pfp.pf.pf
 	shards := pfp.shards.All()
 	if len(shards) == 0 {
-		return nil
+		return
 	}
 
 	a := make([][]ValueWithHits, len(shards))
@@ -129,8 +139,6 @@ func (pfp *pipeFieldValuesLocalProcessor) flush() error {
 		wctx.writeRow(rowValues)
 	}
 	wctx.flush()
-
-	return nil
 }
 
 // MergeValuesWithHits merges a entries and applies the given limit to the number of returned entries.

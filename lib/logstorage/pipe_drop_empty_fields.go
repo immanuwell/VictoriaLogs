@@ -52,9 +52,10 @@ func (pd *pipeDropEmptyFields) updateNeededFields(_ *prefixfilter.Filter) {
 	// nothing to do
 }
 
-func (pd *pipeDropEmptyFields) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pd *pipeDropEmptyFields) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeDropEmptyFieldsProcessor{
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -62,6 +63,7 @@ type pipeDropEmptyFieldsProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeDropEmptyFieldsProcessorShard]
+	cancel func(error)
 }
 
 type pipeDropEmptyFieldsProcessorShard struct {
@@ -82,8 +84,13 @@ func (pdp *pipeDropEmptyFieldsProcessor) writeBlock(workerID uint, br *blockResu
 
 	shard.columnValues = slicesutil.SetLength(shard.columnValues, len(cs))
 	columnValues := shard.columnValues
+	var err error
 	for i, c := range cs {
-		columnValues[i] = c.getValues(br)
+		columnValues[i], err = c.getValues(br)
+		if err != nil {
+			pdp.cancel(err)
+			return
+		}
 	}
 
 	if !hasEmptyValues(columnValues) {
@@ -115,9 +122,7 @@ func (pdp *pipeDropEmptyFieldsProcessor) writeBlock(workerID uint, br *blockResu
 	shard.wctx.flush()
 }
 
-func (pdp *pipeDropEmptyFieldsProcessor) flush() error {
-	return nil
-}
+func (pdp *pipeDropEmptyFieldsProcessor) flush() {}
 
 type pipeDropEmptyFieldsWriteContext struct {
 	workerID uint

@@ -51,9 +51,9 @@ func (fe *filterEqField) matchRow(fields []Field) bool {
 	return v == vOther
 }
 
-func (fe *filterEqField) applyToBlockResult(br *blockResult, bm *bitmap) {
+func (fe *filterEqField) applyToBlockResult(br *blockResult, bm *bitmap) error {
 	if fe.fieldName == fe.otherFieldName {
-		return
+		return nil
 	}
 
 	c := br.getColumnByName(fe.fieldName)
@@ -65,56 +65,69 @@ func (fe *filterEqField) applyToBlockResult(br *blockResult, bm *bitmap) {
 		if v != vOther {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 	if c.isTime && cOther.isTime {
 		// c and cOther point to the same _time column, since only a single _time column may exist
-		return
+		return nil
 	}
 
 	if c.valueType != cOther.valueType {
 		// Slow path - c and cOther have different valueType, so convert them to string values and compare them
-		applyFilterEqString(br, bm, c, cOther)
-		return
+		return applyFilterEqString(br, bm, c, cOther)
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		applyFilterEqString(br, bm, c, cOther)
+		return applyFilterEqString(br, bm, c, cOther)
 	case valueTypeDict:
-		applyFilterEqDict(br, bm, c, cOther)
+		return applyFilterEqDict(br, bm, c, cOther)
 	case valueTypeUint8:
-		applyFilterEqBinValues(br, bm, c, cOther)
+		return applyFilterEqBinValues(br, bm, c, cOther)
 	case valueTypeUint16:
-		applyFilterEqBinValues(br, bm, c, cOther)
+		return applyFilterEqBinValues(br, bm, c, cOther)
 	case valueTypeUint32:
-		applyFilterEqBinValues(br, bm, c, cOther)
+		return applyFilterEqBinValues(br, bm, c, cOther)
 	case valueTypeUint64:
-		applyFilterEqBinValues(br, bm, c, cOther)
+		return applyFilterEqBinValues(br, bm, c, cOther)
 	case valueTypeInt64:
-		applyFilterEqBinValues(br, bm, c, cOther)
+		return applyFilterEqBinValues(br, bm, c, cOther)
 	case valueTypeFloat64:
-		applyFilterEqBinValues(br, bm, c, cOther)
+		return applyFilterEqBinValues(br, bm, c, cOther)
 	case valueTypeIPv4:
-		applyFilterEqBinValues(br, bm, c, cOther)
+		return applyFilterEqBinValues(br, bm, c, cOther)
 	case valueTypeTimestampISO8601:
-		applyFilterEqBinValues(br, bm, c, cOther)
+		return applyFilterEqBinValues(br, bm, c, cOther)
 	default:
 		logger.Panicf("FATAL: unknown valueType=%d", c.valueType)
 	}
+	return nil
 }
 
-func applyFilterEqString(br *blockResult, bm *bitmap, c, cOther *blockResultColumn) {
-	values := c.getValues(br)
-	valuesOther := cOther.getValues(br)
+func applyFilterEqString(br *blockResult, bm *bitmap, c, cOther *blockResultColumn) error {
+	values, err := c.getValues(br)
+	if err != nil {
+		return err
+	}
+	valuesOther, err := cOther.getValues(br)
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		return values[idx] == valuesOther[idx]
 	})
+	return nil
 }
 
-func applyFilterEqDict(br *blockResult, bm *bitmap, c, cOther *blockResultColumn) {
-	valuesEncoded := c.getValuesEncoded(br)
-	valuesEncodedOther := cOther.getValuesEncoded(br)
+func applyFilterEqDict(br *blockResult, bm *bitmap, c, cOther *blockResultColumn) error {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return err
+	}
+	valuesEncodedOther, err := cOther.getValuesEncoded(br)
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		dictIdx := valuesEncoded[idx][0]
 		dictIdxOther := valuesEncodedOther[idx][0]
@@ -122,88 +135,115 @@ func applyFilterEqDict(br *blockResult, bm *bitmap, c, cOther *blockResultColumn
 		vOther := cOther.dictValues[dictIdxOther]
 		return v == vOther
 	})
+	return nil
 }
 
-func applyFilterEqBinValues(br *blockResult, bm *bitmap, c, cOther *blockResultColumn) {
-	valuesEncoded := c.getValuesEncoded(br)
-	valuesEncodedOther := cOther.getValuesEncoded(br)
+func applyFilterEqBinValues(br *blockResult, bm *bitmap, c, cOther *blockResultColumn) error {
+	valuesEncoded, err := c.getValuesEncoded(br)
+	if err != nil {
+		return err
+	}
+	valuesEncodedOther, err := cOther.getValuesEncoded(br)
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		return valuesEncoded[idx] == valuesEncodedOther[idx]
 	})
+	return nil
 }
 
-func (fe *filterEqField) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
+func (fe *filterEqField) applyToBlockSearch(bs *blockSearch, bm *bitmap) error {
 	if fe.fieldName == fe.otherFieldName {
-		return
+		return nil
 	}
 
-	v := bs.getConstColumnValue(fe.fieldName)
-	vOther := bs.getConstColumnValue(fe.otherFieldName)
+	v, err := bs.getConstColumnValue(fe.fieldName)
+	if err != nil {
+		return err
+	}
+	vOther, err := bs.getConstColumnValue(fe.otherFieldName)
+	if err != nil {
+		return err
+	}
 	if v != "" || vOther != "" {
 		if v != "" && vOther != "" {
 			if v != vOther {
 				bm.resetBits()
 			}
-			return
+			return nil
 		}
-		fe.applyFilterString(bs, bm)
-		return
+		return fe.applyFilterString(bs, bm)
 	}
 
-	ch := bs.getColumnHeader(fe.fieldName)
-	chOther := bs.getColumnHeader(fe.otherFieldName)
+	ch, err := bs.getColumnHeader(fe.fieldName)
+	if err != nil {
+		return err
+	}
+	chOther, err := bs.getColumnHeader(fe.otherFieldName)
+	if err != nil {
+		return err
+	}
 	if ch == nil || chOther == nil {
 		if ch == nil && chOther == nil {
-			return
+			return nil
 		}
-		fe.applyFilterString(bs, bm)
-		return
+		return fe.applyFilterString(bs, bm)
 	}
 
 	if ch.valueType != chOther.valueType {
 		// Slow path - c and cOther have different valueType, so convert them to string values and compare them
-		fe.applyFilterString(bs, bm)
-		return
+		return fe.applyFilterString(bs, bm)
 	}
 
 	switch ch.valueType {
 	case valueTypeString:
-		fe.applyFilterString(bs, bm)
+		return fe.applyFilterString(bs, bm)
 	case valueTypeDict:
-		fe.applyFilterDict(bs, bm, ch, chOther)
+		return fe.applyFilterDict(bs, bm, ch, chOther)
 	case valueTypeUint8:
-		fe.applyFilterBinValue(bs, bm, ch, chOther)
+		return fe.applyFilterBinValue(bs, bm, ch, chOther)
 	case valueTypeUint16:
-		fe.applyFilterBinValue(bs, bm, ch, chOther)
+		return fe.applyFilterBinValue(bs, bm, ch, chOther)
 	case valueTypeUint32:
-		fe.applyFilterBinValue(bs, bm, ch, chOther)
+		return fe.applyFilterBinValue(bs, bm, ch, chOther)
 	case valueTypeUint64:
-		fe.applyFilterBinValue(bs, bm, ch, chOther)
+		return fe.applyFilterBinValue(bs, bm, ch, chOther)
 	case valueTypeInt64:
-		fe.applyFilterBinValue(bs, bm, ch, chOther)
+		return fe.applyFilterBinValue(bs, bm, ch, chOther)
 	case valueTypeFloat64:
-		fe.applyFilterBinValue(bs, bm, ch, chOther)
+		return fe.applyFilterBinValue(bs, bm, ch, chOther)
 	case valueTypeIPv4:
-		fe.applyFilterBinValue(bs, bm, ch, chOther)
+		return fe.applyFilterBinValue(bs, bm, ch, chOther)
 	case valueTypeTimestampISO8601:
-		fe.applyFilterBinValue(bs, bm, ch, chOther)
+		return fe.applyFilterBinValue(bs, bm, ch, chOther)
 	default:
 		logger.Panicf("FATAL: %s: unknown valueType=%d", bs.partPath(), ch.valueType)
 	}
+	return nil
 }
 
-func (fe *filterEqField) applyFilterString(bs *blockSearch, bm *bitmap) {
+func (fe *filterEqField) applyFilterString(bs *blockSearch, bm *bitmap) error {
 	br := getBlockResult()
+	defer putBlockResult(br)
 	br.mustInit(bs, bm)
 
 	pf := fe.getPrefixFilter()
-	br.initColumns(pf)
+	if err := br.initColumns(pf); err != nil {
+		return err
+	}
 
 	c := br.getColumnByName(fe.fieldName)
 	cOther := br.getColumnByName(fe.otherFieldName)
 
-	values := c.getValues(br)
-	valuesOther := cOther.getValues(br)
+	values, err := c.getValues(br)
+	if err != nil {
+		return err
+	}
+	valuesOther, err := cOther.getValues(br)
+	if err != nil {
+		return err
+	}
 
 	srcIdx := 0
 	bm.forEachSetBit(func(_ int) bool {
@@ -212,12 +252,18 @@ func (fe *filterEqField) applyFilterString(bs *blockSearch, bm *bitmap) {
 		return ok
 	})
 
-	putBlockResult(br)
+	return nil
 }
 
-func (fe *filterEqField) applyFilterDict(bs *blockSearch, bm *bitmap, ch, chOther *columnHeader) {
-	valuesEncoded := bs.getValuesForColumn(ch)
-	valuesEncodedOther := bs.getValuesForColumn(chOther)
+func (fe *filterEqField) applyFilterDict(bs *blockSearch, bm *bitmap, ch, chOther *columnHeader) error {
+	valuesEncoded, err := bs.getValuesForColumn(ch)
+	if err != nil {
+		return err
+	}
+	valuesEncodedOther, err := bs.getValuesForColumn(chOther)
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		dictIdx := valuesEncoded[idx][0]
 		dictIdxOther := valuesEncodedOther[idx][0]
@@ -225,14 +271,22 @@ func (fe *filterEqField) applyFilterDict(bs *blockSearch, bm *bitmap, ch, chOthe
 		vOther := chOther.valuesDict.values[dictIdxOther]
 		return v == vOther
 	})
+	return nil
 }
 
-func (fe *filterEqField) applyFilterBinValue(bs *blockSearch, bm *bitmap, ch, chOther *columnHeader) {
-	valuesEncoded := bs.getValuesForColumn(ch)
-	valuesEncodedOther := bs.getValuesForColumn(chOther)
+func (fe *filterEqField) applyFilterBinValue(bs *blockSearch, bm *bitmap, ch, chOther *columnHeader) error {
+	valuesEncoded, err := bs.getValuesForColumn(ch)
+	if err != nil {
+		return err
+	}
+	valuesEncodedOther, err := bs.getValuesForColumn(chOther)
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		return valuesEncoded[idx] == valuesEncodedOther[idx]
 	})
+	return nil
 }
 
 func getBlockResult() *blockResult {

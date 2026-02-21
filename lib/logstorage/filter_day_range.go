@@ -45,13 +45,13 @@ func (fr *filterDayRange) matchRow(fields []Field) bool {
 	return fr.matchTimestampString(v)
 }
 
-func (fr *filterDayRange) applyToBlockResult(br *blockResult, bm *bitmap) {
+func (fr *filterDayRange) applyToBlockResult(br *blockResult, bm *bitmap) error {
 	if fr.start > fr.end {
 		bm.resetBits()
-		return
+		return nil
 	}
 	if fr.start == 0 && fr.end == nsecsPerDay-1 {
-		return
+		return nil
 	}
 
 	c := br.getColumnByName("_time")
@@ -60,26 +60,33 @@ func (fr *filterDayRange) applyToBlockResult(br *blockResult, bm *bitmap) {
 		if !fr.matchTimestampString(v) {
 			bm.resetBits()
 		}
-		return
+		return nil
 	}
 	if c.isTime {
-		timestamps := br.getTimestamps()
+		timestamps, err := br.getTimestamps()
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			timestamp := timestamps[idx]
 			return fr.matchTimestampValue(timestamp)
 		})
-		return
+		return nil
 	}
 
 	switch c.valueType {
 	case valueTypeString:
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := values[idx]
 			return fr.matchTimestampString(v)
 		})
 	case valueTypeDict:
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		for _, v := range c.dictValues {
 			c := byte(0)
 			if fr.matchTimestampString(v) {
@@ -87,12 +94,14 @@ func (fr *filterDayRange) applyToBlockResult(br *blockResult, bm *bitmap) {
 			}
 			bb.B = append(bb.B, c)
 		}
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			n := valuesEncoded[idx][0]
 			return bb.B[n] == 1
 		})
-		bbPool.Put(bb)
 	case valueTypeUint8:
 		bm.resetBits()
 	case valueTypeUint16:
@@ -108,7 +117,10 @@ func (fr *filterDayRange) applyToBlockResult(br *blockResult, bm *bitmap) {
 	case valueTypeIPv4:
 		bm.resetBits()
 	case valueTypeTimestampISO8601:
-		valuesEncoded := c.getValuesEncoded(br)
+		valuesEncoded, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		bm.forEachSetBit(func(idx int) bool {
 			v := valuesEncoded[idx]
 			timestamp := unmarshalTimestampISO8601(v)
@@ -117,6 +129,7 @@ func (fr *filterDayRange) applyToBlockResult(br *blockResult, bm *bitmap) {
 	default:
 		logger.Panicf("FATAL: unknown valueType=%d", c.valueType)
 	}
+	return nil
 }
 
 func (fr *filterDayRange) matchTimestampString(v string) bool {
@@ -137,17 +150,21 @@ func (fr *filterDayRange) dayRangeOffset(timestamp int64) int64 {
 	return timestamp % nsecsPerDay
 }
 
-func (fr *filterDayRange) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
+func (fr *filterDayRange) applyToBlockSearch(bs *blockSearch, bm *bitmap) error {
 	if fr.start > fr.end {
 		bm.resetBits()
-		return
+		return nil
 	}
 	if fr.start == 0 && fr.end == nsecsPerDay-1 {
-		return
+		return nil
 	}
 
-	timestamps := bs.getTimestamps()
+	timestamps, err := bs.getTimestamps()
+	if err != nil {
+		return err
+	}
 	bm.forEachSetBit(func(idx int) bool {
 		return fr.matchTimestampValue(timestamps[idx])
 	})
+	return nil
 }

@@ -26,10 +26,10 @@ func (fn *filterNoop) matchRow(fields []Field) bool {
 	return true
 }
 
-func (fn *filterNoop) applyToBlockResult(_ *blockResult, _ *bitmap) {
-	// nothing to do
+func (fn *filterNoop) applyToBlockResult(_ *blockResult, _ *bitmap) error {
+	return nil
 }
 
-func (fn *filterNoop) applyToBlockSearch(_ *blockSearch, _ *bitmap) {
-	// nothing to do
+func (fn *filterNoop) applyToBlockSearch(_ *blockSearch, _ *bitmap) error {
+	return nil
 }

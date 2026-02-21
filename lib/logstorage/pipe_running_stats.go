@@ -130,7 +130,7 @@ func (ps *pipeRunningStats) visitSubqueries(visitFunc func(q *Query)) {
 	// nothing to do
 }
 
-func (ps *pipeRunningStats) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (ps *pipeRunningStats) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	maxStateSize := int64(float64(memory.Allowed()) * 0.4)
 
 	psp := &pipeRunningStatsProcessor{
@@ -141,6 +141,9 @@ func (ps *pipeRunningStats) newPipeProcessor(_ int, stopCh <-chan struct{}, canc
 
 		maxStateSize: maxStateSize,
 	}
+	psp.shards.Init = func(shard *pipeRunningStatsProcessorShard) {
+		shard.psp = psp
+	}
 
 	psp.stateSizeBudget.Store(maxStateSize)
 
@@ -150,7 +153,7 @@ func (ps *pipeRunningStats) newPipeProcessor(_ int, stopCh <-chan struct{}, canc
 type pipeRunningStatsProcessor struct {
 	ps     *pipeRunningStats
 	stopCh <-chan struct{}
-	cancel func()
+	cancel func(error)
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeRunningStatsProcessorShard]
@@ -160,6 +163,8 @@ type pipeRunningStatsProcessor struct {
 }
 
 type pipeRunningStatsProcessorShard struct {
+	psp *pipeRunningStatsProcessor
+
 	// rows tracks all the rows collected by the shard.
 	rows [][]Field
 
@@ -173,7 +178,12 @@ func (shard *pipeRunningStatsProcessorShard) writeBlock(br *blockResult) {
 
 	columnValues := slicesutil.SetLength(shard.columnValues, len(cs))
 	for i, c := range cs {
-		columnValues[i] = c.getValues(br)
+		var err error
+		columnValues[i], err = c.getValues(br)
+		if err != nil {
+			shard.psp.cancel(err)
+			return
+		}
 	}
 	shard.columnValues = columnValues
 
@@ -209,7 +219,7 @@ func (psp *pipeRunningStatsProcessor) writeBlock(workerID uint, br *blockResult)
 			// The state size is too big. Stop processing data in order to avoid OOM crash.
 			if remaining+stateSizeBudgetChunk >= 0 {
 				// Notify worker goroutines to stop calling writeBlock() in order to save CPU time.
-				psp.cancel()
+				psp.cancel(nil)
 			}
 			return
 		}
@@ -219,9 +229,10 @@ func (psp *pipeRunningStatsProcessor) writeBlock(workerID uint, br *blockResult)
 	shard.writeBlock(br)
 }
 
-func (psp *pipeRunningStatsProcessor) flush() error {
+func (psp *pipeRunningStatsProcessor) flush() {
 	if n := psp.stateSizeBudget.Load(); n <= 0 {
-		return fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", psp.ps.String(), psp.maxStateSize/(1<<20))
+		psp.cancel(fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", psp.ps.String(), psp.maxStateSize/(1<<20)))
+		return
 	}
 
 	getKeyForRow := func(row []Field) string {
@@ -243,7 +254,7 @@ func (psp *pipeRunningStatsProcessor) flush() error {
 	for _, shard := range shards {
 		for _, row := range shard.rows {
 			if needStop(psp.stopCh) {
-				return nil
+				return
 			}
 
 			key := getKeyForRow(row)
@@ -275,7 +286,7 @@ func (psp *pipeRunningStatsProcessor) flush() error {
 		})
 
 		if needStop(psp.stopCh) {
-			return nil
+			return
 		}
 
 		sps := make([]runningStatsProcessor, len(funcs))
@@ -310,8 +321,6 @@ func (psp *pipeRunningStatsProcessor) flush() error {
 	}
 
 	wctx.flush()
-
-	return nil
 }
 
 type pipeRunningStatsWriter struct {

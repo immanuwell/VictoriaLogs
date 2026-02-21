@@ -196,12 +196,12 @@ type statsProcessor interface {
 	// It must return the change of internal state size in bytes for the statsProcessor.
 	//
 	// It is guaranteed that br contains at least a single row.
-	updateStatsForAllRows(sf statsFunc, br *blockResult) int
+	updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error)
 
 	// updateStatsForRow must update statsProcessor stats for the row at rowIndex in br.
 	//
 	// It must return the change of internal state size in bytes for the statsProcessor.
-	updateStatsForRow(sf statsFunc, br *blockResult, rowIndex int) int
+	updateStatsForRow(sf statsFunc, br *blockResult, rowIndex int) (int, error)
 
 	// mergeState must merge sfp state into statsProcessor state.
 	//
@@ -417,7 +417,7 @@ func (ps *pipeStats) initRateFuncs(step int64) {
 
 const stateSizeBudgetChunk = 1 << 20
 
-func (ps *pipeStats) newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(), ppNext pipeProcessor) pipeProcessor {
+func (ps *pipeStats) newPipeProcessor(concurrency int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	maxStateSize := int64(float64(memory.Allowed()) * 0.4)
 
 	psp := &pipeStatsProcessor{
@@ -443,16 +443,13 @@ type pipeStatsProcessor struct {
 	ps          *pipeStats
 	concurrency int
 	stopCh      <-chan struct{}
-	cancel      func()
+	cancel      func(error)
 	ppNext      pipeProcessor
 
 	shards atomicutil.Slice[pipeStatsProcessorShard]
 
 	maxStateSize    int64
 	stateSizeBudget atomic.Int64
-
-	errLock sync.Mutex
-	err     error
 }
 
 type pipeStatsProcessorShard struct {
@@ -653,33 +650,42 @@ func (shard *pipeStatsProcessorShard) newPipeStatsGroup() *pipeStatsGroup {
 	return psg
 }
 
-func (shard *pipeStatsProcessorShard) writeBlockDefault(br *blockResult) {
+func (shard *pipeStatsProcessorShard) writeBlockDefault(br *blockResult) error {
 	byFields := shard.psp.ps.byFields
 
 	// Update shard.bms by applying per-function filters
-	shard.applyPerFunctionFilters(br)
+	if err := shard.applyPerFunctionFilters(br); err != nil {
+		return err
+	}
 
 	// Process stats for the defined functions
 	if len(byFields) == 0 {
 		// Fast path - pass all the rows to a single group with empty key.
 		psg := shard.getPipeStatsGroupString(nil)
-		shard.stateSizeBudget -= psg.updateStatsForAllRows(shard.bms, br, &shard.brTmp)
-		return
+		state, err := psg.updateStatsForAllRows(shard.bms, br, &shard.brTmp)
+		if err != nil {
+			return err
+		}
+		shard.stateSizeBudget -= state
+		return nil
 	}
 	if len(byFields) == 1 {
 		// Special case for grouping by a single column.
-		shard.updateStatsSingleColumn(br, byFields[0])
-		return
+		return shard.updateStatsSingleColumn(br, byFields[0])
 	}
 
 	// Obtain columns for byFields
 	columnValues := slicesutil.SetLength(shard.columnValues, len(byFields))
 	for i, bf := range byFields {
 		c := br.getColumnByName(bf.name)
+		var err error
 		if bf.hasBucketConfig() {
-			columnValues[i] = c.getValuesBucketed(br, bf)
+			columnValues[i], err = c.getValuesBucketed(br, bf)
 		} else {
-			columnValues[i] = c.getValues(br)
+			columnValues[i], err = c.getValues(br)
+		}
+		if err != nil {
+			return err
 		}
 	}
 	shard.columnValues = columnValues
@@ -699,9 +705,13 @@ func (shard *pipeStatsProcessorShard) writeBlockDefault(br *blockResult) {
 			keyBuf = encoding.MarshalBytes(keyBuf, bytesutil.ToUnsafeBytes(values[0]))
 		}
 		psg := shard.getPipeStatsGroupString(keyBuf)
-		shard.stateSizeBudget -= psg.updateStatsForAllRows(shard.bms, br, &shard.brTmp)
+		state, err := psg.updateStatsForAllRows(shard.bms, br, &shard.brTmp)
+		if err != nil {
+			return err
+		}
+		shard.stateSizeBudget -= state
 		shard.keyBuf = keyBuf
-		return
+		return nil
 	}
 
 	// The slowest path - group by multiple columns with different values across rows.
@@ -724,12 +734,17 @@ func (shard *pipeStatsProcessorShard) writeBlockDefault(br *blockResult) {
 			}
 			psg = shard.getPipeStatsGroupString(keyBuf)
 		}
-		shard.stateSizeBudget -= psg.updateStatsForRow(shard.bms, br, i)
+		state, err := psg.updateStatsForRow(shard.bms, br, i)
+		if err != nil {
+			return err
+		}
+		shard.stateSizeBudget -= state
 	}
 	shard.keyBuf = keyBuf
+	return nil
 }
 
-func (shard *pipeStatsProcessorShard) writeBlockLocal(br *blockResult) {
+func (shard *pipeStatsProcessorShard) writeBlockLocal(br *blockResult) error {
 	byFields := shard.psp.ps.byFields
 	stopCh := shard.psp.stopCh
 
@@ -737,30 +752,29 @@ func (shard *pipeStatsProcessorShard) writeBlockLocal(br *blockResult) {
 	shard.columnValues = slicesutil.SetLength(shard.columnValues, len(cs))
 	columnValues := shard.columnValues
 	for i, c := range cs {
-		columnValues[i] = c.getValues(br)
+		var err error
+		columnValues[i], err = c.getValues(br)
+		if err != nil {
+			return err
+		}
 	}
 	if len(columnValues) < len(byFields)+1 {
-		err := fmt.Errorf("at least %d columns must exist; got %d columns only", len(byFields)+1, len(columnValues))
-		shard.psp.setError(err)
-		return
+		return fmt.Errorf("at least %d columns must exist; got %d columns only", len(byFields)+1, len(columnValues))
 	}
 	byFieldValues := columnValues[:len(byFields)]
 	columnValues = columnValues[len(byFields):]
 
 	if len(byFields) == 0 {
 		if br.rowsLen != 1 {
-			err := fmt.Errorf("global stats must have only a single row; got %d rows", br.rowsLen)
-			shard.psp.setError(err)
-			return
+			return fmt.Errorf("global stats must have only a single row; got %d rows", br.rowsLen)
 		}
 		psg := shard.getPipeStatsGroupString(nil)
 		stateSize, err := psg.importStateFromRow(columnValues, 0, stopCh)
 		if err != nil {
-			shard.psp.setError(err)
-			return
+			return err
 		}
 		shard.stateSizeBudget -= stateSize
-		return
+		return nil
 	}
 	if len(byFields) == 1 {
 		for rowIdx := range br.rowsLen {
@@ -768,8 +782,7 @@ func (shard *pipeStatsProcessorShard) writeBlockLocal(br *blockResult) {
 			psg := shard.getPipeStatsGroupGeneric(v)
 			stateSize, err := psg.importStateFromRow(columnValues, rowIdx, stopCh)
 			if err != nil {
-				shard.psp.setError(err)
-				return
+				return err
 			}
 			shard.stateSizeBudget -= stateSize
 
@@ -777,7 +790,7 @@ func (shard *pipeStatsProcessorShard) writeBlockLocal(br *blockResult) {
 				break
 			}
 		}
-		return
+		return nil
 	}
 
 	keyBuf := shard.keyBuf
@@ -789,8 +802,7 @@ func (shard *pipeStatsProcessorShard) writeBlockLocal(br *blockResult) {
 		psg := shard.getPipeStatsGroupString(keyBuf)
 		stateSize, err := psg.importStateFromRow(columnValues, rowIdx, stopCh)
 		if err != nil {
-			shard.psp.setError(err)
-			return
+			return err
 		}
 		shard.stateSizeBudget -= stateSize
 
@@ -799,9 +811,10 @@ func (shard *pipeStatsProcessorShard) writeBlockLocal(br *blockResult) {
 		}
 	}
 	shard.keyBuf = keyBuf
+	return nil
 }
 
-func (shard *pipeStatsProcessorShard) updateStatsSingleColumn(br *blockResult, bf *byStatsField) {
+func (shard *pipeStatsProcessorShard) updateStatsSingleColumn(br *blockResult, bf *byStatsField) error {
 	c := br.getColumnByName(bf.name)
 	if c.isConst {
 		// Fast path for column with a constant value.
@@ -810,17 +823,28 @@ func (shard *pipeStatsProcessorShard) updateStatsSingleColumn(br *blockResult, b
 			v = br.getBucketedValue(c.valuesEncoded[0], bf)
 		}
 		psg := shard.getPipeStatsGroupGeneric(v)
-		shard.stateSizeBudget -= psg.updateStatsForAllRows(shard.bms, br, &shard.brTmp)
-		return
+		state, err := psg.updateStatsForAllRows(shard.bms, br, &shard.brTmp)
+		if err != nil {
+			return err
+		}
+		shard.stateSizeBudget -= state
+		return nil
 	}
 
 	if bf.hasBucketConfig() {
-		values := c.getValuesBucketed(br, bf)
+		values, err := c.getValuesBucketed(br, bf)
+		if err != nil {
+			return err
+		}
 		if areConstValues(values) {
 			// Fast path - values are constant after bucketing.
 			psg := shard.getPipeStatsGroupGeneric(values[0])
-			shard.stateSizeBudget -= psg.updateStatsForAllRows(shard.bms, br, &shard.brTmp)
-			return
+			state, err := psg.updateStatsForAllRows(shard.bms, br, &shard.brTmp)
+			if err != nil {
+				return err
+			}
+			shard.stateSizeBudget -= state
+			return nil
 		}
 
 		var psg *pipeStatsGroup
@@ -828,82 +852,129 @@ func (shard *pipeStatsProcessorShard) updateStatsSingleColumn(br *blockResult, b
 			if i <= 0 || values[i-1] != values[i] {
 				psg = shard.getPipeStatsGroupGeneric(values[i])
 			}
-			shard.stateSizeBudget -= psg.updateStatsForRow(shard.bms, br, i)
+			state, err := psg.updateStatsForRow(shard.bms, br, i)
+			if err != nil {
+				return err
+			}
+			shard.stateSizeBudget -= state
 		}
-		return
+		return nil
 	}
 
 	switch c.valueType {
 	case valueTypeUint8:
 		var psg *pipeStatsGroup
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for i, v := range values {
 			if i <= 0 || values[i-1] != v {
 				n := unmarshalUint8(v)
 				psg = shard.getPipeStatsGroupUint64(uint64(n))
 			}
-			shard.stateSizeBudget -= psg.updateStatsForRow(shard.bms, br, i)
+			state, err := psg.updateStatsForRow(shard.bms, br, i)
+			if err != nil {
+				return err
+			}
+			shard.stateSizeBudget -= state
 		}
-		return
+		return nil
 	case valueTypeUint16:
 		var psg *pipeStatsGroup
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for i, v := range values {
 			if i <= 0 || values[i-1] != v {
 				n := unmarshalUint16(v)
 				psg = shard.getPipeStatsGroupUint64(uint64(n))
 			}
-			shard.stateSizeBudget -= psg.updateStatsForRow(shard.bms, br, i)
+			state, err := psg.updateStatsForRow(shard.bms, br, i)
+			if err != nil {
+				return err
+			}
+			shard.stateSizeBudget -= state
 		}
-		return
+		return nil
 	case valueTypeUint32:
 		var psg *pipeStatsGroup
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for i, v := range values {
 			if i <= 0 || values[i-1] != v {
 				n := unmarshalUint32(v)
 				psg = shard.getPipeStatsGroupUint64(uint64(n))
 			}
-			shard.stateSizeBudget -= psg.updateStatsForRow(shard.bms, br, i)
+			state, err := psg.updateStatsForRow(shard.bms, br, i)
+			if err != nil {
+				return err
+			}
+			shard.stateSizeBudget -= state
 		}
-		return
+		return nil
 	case valueTypeUint64:
 		var psg *pipeStatsGroup
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for i, v := range values {
 			if i <= 0 || values[i-1] != v {
 				n := unmarshalUint64(v)
 				psg = shard.getPipeStatsGroupUint64(n)
 			}
-			shard.stateSizeBudget -= psg.updateStatsForRow(shard.bms, br, i)
+			state, err := psg.updateStatsForRow(shard.bms, br, i)
+			if err != nil {
+				return err
+			}
+			shard.stateSizeBudget -= state
 		}
-		return
+		return nil
 	case valueTypeInt64:
 		var psg *pipeStatsGroup
-		values := c.getValuesEncoded(br)
+		values, err := c.getValuesEncoded(br)
+		if err != nil {
+			return err
+		}
 		for i, v := range values {
 			if i <= 0 || values[i-1] != v {
 				n := unmarshalInt64(v)
 				psg = shard.getPipeStatsGroupInt64(n)
 			}
-			shard.stateSizeBudget -= psg.updateStatsForRow(shard.bms, br, i)
+			state, err := psg.updateStatsForRow(shard.bms, br, i)
+			if err != nil {
+				return err
+			}
+			shard.stateSizeBudget -= state
 		}
-		return
+		return nil
 	}
 
 	// Generic path for a column with different values.
-	values := c.getValues(br)
+	values, err := c.getValues(br)
+	if err != nil {
+		return err
+	}
 
 	var psg *pipeStatsGroup
 	for i := range br.rowsLen {
 		if i <= 0 || values[i-1] != values[i] {
 			psg = shard.getPipeStatsGroupGeneric(values[i])
 		}
-		shard.stateSizeBudget -= psg.updateStatsForRow(shard.bms, br, i)
+		state, err := psg.updateStatsForRow(shard.bms, br, i)
+		if err != nil {
+			return err
+		}
+		shard.stateSizeBudget -= state
 	}
+	return nil
 }
 
-func (shard *pipeStatsProcessorShard) applyPerFunctionFilters(br *blockResult) {
+func (shard *pipeStatsProcessorShard) applyPerFunctionFilters(br *blockResult) error {
 	funcs := shard.psp.ps.funcs
 	for i := range funcs {
 		iff := funcs[i].iff
@@ -915,8 +986,11 @@ func (shard *pipeStatsProcessorShard) applyPerFunctionFilters(br *blockResult) {
 		bm.init(br.rowsLen)
 		bm.setBits()
 
-		iff.f.applyToBlockResult(br, bm)
+		if err := iff.f.applyToBlockResult(br, bm); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (shard *pipeStatsProcessorShard) getPipeStatsGroupGeneric(v string) *pipeStatsGroup {
@@ -1050,40 +1124,45 @@ func (psg *pipeStatsGroup) mergeState(a *chunkedAllocator, src *pipeStatsGroup) 
 	}
 }
 
-func (psg *pipeStatsGroup) updateStatsForAllRows(bms []bitmap, br, brTmp *blockResult) int {
+func (psg *pipeStatsGroup) updateStatsForAllRows(bms []bitmap, br, brTmp *blockResult) (int, error) {
 	n := 0
 	for i, sfp := range psg.sfps {
 		f := &psg.funcs[i]
 		iff := f.iff
 		if iff == nil {
-			n += sfp.updateStatsForAllRows(f.f, br)
+			v, err := sfp.updateStatsForAllRows(f.f, br)
+			if err != nil {
+				return 0, nil
+			}
+			n += v
 		} else {
 			brTmp.initFromFilterAllColumns(br, &bms[i])
 			if brTmp.rowsLen > 0 {
-				n += sfp.updateStatsForAllRows(f.f, brTmp)
+				v, err := sfp.updateStatsForAllRows(f.f, brTmp)
+				if err != nil {
+					return 0, nil
+				}
+				n += v
 			}
 		}
 	}
-	return n
+	return n, nil
 }
 
-func (psg *pipeStatsGroup) updateStatsForRow(bms []bitmap, br *blockResult, rowIdx int) int {
+func (psg *pipeStatsGroup) updateStatsForRow(bms []bitmap, br *blockResult, rowIdx int) (int, error) {
 	n := 0
 	for i, sfp := range psg.sfps {
 		f := &psg.funcs[i]
 		iff := f.iff
 		if iff == nil || bms[i].isSetBit(rowIdx) {
-			n += sfp.updateStatsForRow(f.f, br, rowIdx)
+			v, err := sfp.updateStatsForRow(f.f, br, rowIdx)
+			if err != nil {
+				return 0, err
+			}
+			n += v
 		}
 	}
-	return n
-}
-
-func (psp *pipeStatsProcessor) setError(err error) {
-	psp.errLock.Lock()
-	psp.err = err
-	psp.errLock.Unlock()
-	psp.cancel()
+	return n, nil
 }
 
 func (psp *pipeStatsProcessor) writeBlock(workerID uint, br *blockResult) {
@@ -1100,33 +1179,34 @@ func (psp *pipeStatsProcessor) writeBlock(workerID uint, br *blockResult) {
 			// The state size is too big. Stop processing data in order to avoid OOM crash.
 			if remaining+stateSizeBudgetChunk >= 0 {
 				// Notify worker goroutines to stop calling writeBlock() in order to save CPU time.
-				psp.cancel()
+				psp.cancel(nil)
 			}
 			return
 		}
 		shard.stateSizeBudget += stateSizeBudgetChunk
 	}
 
+	var err error
 	if psp.ps.mode.needImportState() {
-		shard.writeBlockLocal(br)
+		err = shard.writeBlockLocal(br)
 	} else {
-		shard.writeBlockDefault(br)
+		err = shard.writeBlockDefault(br)
+	}
+	if err != nil {
+		psp.cancel(err)
+		return
 	}
 }
 
-func (psp *pipeStatsProcessor) flush() error {
-	if psp.err != nil {
-		return psp.err
-	}
-
+func (psp *pipeStatsProcessor) flush() {
 	if n := psp.stateSizeBudget.Load(); n <= 0 {
-		return fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", psp.ps.String(), psp.maxStateSize/(1<<20))
+		psp.cancel(fmt.Errorf("cannot calculate [%s], since it requires more than %dMB of memory", psp.ps.String(), psp.maxStateSize/(1<<20)))
 	}
 
 	// Merge states across shards in parallel
 	psms := psp.mergeShardsParallel()
 	if needStop(psp.stopCh) {
-		return nil
+		return
 	}
 
 	if len(psp.ps.byFields) == 0 && len(psms) == 0 {
@@ -1147,8 +1227,6 @@ func (psp *pipeStatsProcessor) flush() error {
 		})
 	}
 	wg.Wait()
-
-	return nil
 }
 
 type pipeStatsWriter struct {

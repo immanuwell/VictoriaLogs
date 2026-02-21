@@ -150,11 +150,12 @@ func (pj *pipeJoin) updateNeededFields(pf *prefixfilter.Filter) {
 	pf.AddAllowFilters(pj.byFields)
 }
 
-func (pj *pipeJoin) newPipeProcessor(_ int, stopCh <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pj *pipeJoin) newPipeProcessor(_ int, stopCh <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	return &pipeJoinProcessor{
 		pj:     pj,
 		stopCh: stopCh,
 		ppNext: ppNext,
+		cancel: cancel,
 	}
 }
 
@@ -164,6 +165,7 @@ type pipeJoinProcessor struct {
 	ppNext pipeProcessor
 
 	shards atomicutil.Slice[pipeJoinProcessorShard]
+	cancel func(error)
 }
 
 type pipeJoinProcessorShard struct {
@@ -183,6 +185,11 @@ func (pjp *pipeJoinProcessor) writeBlock(workerID uint, br *blockResult) {
 	shard := pjp.shards.Get(workerID)
 	shard.wctx.init(workerID, pjp.ppNext, true, true, br)
 
+	defer func() {
+		shard.wctx.flush()
+		shard.wctx.reset()
+	}()
+
 	shard.byValues = slicesutil.SetLength(shard.byValues, len(pj.byFields))
 	byValues := shard.byValues
 
@@ -199,7 +206,11 @@ func (pjp *pipeJoinProcessor) writeBlock(workerID uint, br *blockResult) {
 		clear(byValues)
 		for j := range cs {
 			if cIdx := byValuesIdxs[j]; cIdx >= 0 {
-				byValues[cIdx] = cs[j].getValueAtRow(br, rowIdx)
+				var err error
+				if byValues[cIdx], err = cs[j].getValueAtRow(br, rowIdx); err != nil {
+					pjp.cancel(err)
+					return
+				}
 			}
 		}
 
@@ -208,7 +219,10 @@ func (pjp *pipeJoinProcessor) writeBlock(workerID uint, br *blockResult) {
 
 		if len(matchingRows) == 0 {
 			if !pj.isInner {
-				shard.wctx.writeRow(rowIdx, nil)
+				if err := shard.wctx.writeRow(rowIdx, nil); err != nil {
+					pjp.cancel(err)
+					return
+				}
 			}
 			continue
 		}
@@ -216,17 +230,15 @@ func (pjp *pipeJoinProcessor) writeBlock(workerID uint, br *blockResult) {
 			if needStop(pjp.stopCh) {
 				return
 			}
-			shard.wctx.writeRow(rowIdx, extraFields)
+			if err := shard.wctx.writeRow(rowIdx, extraFields); err != nil {
+				pjp.cancel(err)
+				return
+			}
 		}
 	}
-
-	shard.wctx.flush()
-	shard.wctx.reset()
 }
 
-func (pjp *pipeJoinProcessor) flush() error {
-	return nil
-}
+func (pjp *pipeJoinProcessor) flush() {}
 
 func parsePipeJoin(lex *lexer) (pipe, error) {
 	if !lex.isKeyword("join") {

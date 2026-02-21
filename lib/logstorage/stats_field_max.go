@@ -37,32 +37,43 @@ type statsFieldMaxProcessor struct {
 	value string
 }
 
-func (smp *statsFieldMaxProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (smp *statsFieldMaxProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sm := sf.(*statsFieldMax)
 	stateSizeIncrease := 0
 
 	c := br.getColumnByName(sm.srcField)
 	if c.isConst {
 		v := c.valuesEncoded[0]
-		stateSizeIncrease += smp.updateState(sm, v, br, 0)
-		return stateSizeIncrease
+		state, err := smp.updateState(sm, v, br, 0)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
+		return stateSizeIncrease, nil
 	}
 	if c.isTime {
 		timestamp, ok := TryParseTimestampRFC3339Nano(smp.max)
 		if !ok {
 			timestamp = -1 << 63
 		}
-		maxTimestamp := br.getMaxTimestamp(timestamp)
+		maxTimestamp, err := br.getMaxTimestamp(timestamp)
+		if err != nil {
+			return 0, err
+		}
 		if maxTimestamp <= timestamp {
-			return stateSizeIncrease
+			return stateSizeIncrease, nil
 		}
 
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		bb.B = marshalTimestampRFC3339NanoString(bb.B[:0], maxTimestamp)
 		v := bytesutil.ToUnsafeString(bb.B)
-		stateSizeIncrease += smp.updateState(sm, v, br, br.rowsLen-1)
-		bbPool.Put(bb)
-		return stateSizeIncrease
+		state, err := smp.updateState(sm, v, br, br.rowsLen-1)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
+		return stateSizeIncrease, nil
 	}
 
 	needUpdateState := false
@@ -70,11 +81,14 @@ func (smp *statsFieldMaxProcessor) updateStatsForAllRows(sf statsFunc, br *block
 	case valueTypeString:
 		needUpdateState = true
 	case valueTypeDict:
-		c.forEachDictValue(br, func(v string) {
+		err := c.forEachDictValue(br, func(v string) {
 			if !needUpdateState && smp.needUpdateStateString(v) {
 				needUpdateState = true
 			}
 		})
+		if err != nil {
+			return 0, err
+		}
 	case valueTypeUint8, valueTypeUint16, valueTypeUint32, valueTypeUint64:
 		bb := bbPool.Get()
 		bb.B = marshalUint64String(bb.B[:0], c.maxValue)
@@ -106,39 +120,64 @@ func (smp *statsFieldMaxProcessor) updateStatsForAllRows(sf statsFunc, br *block
 	}
 
 	if needUpdateState {
-		values := c.getValues(br)
+		values, err := c.getValues(br)
+		if err != nil {
+			return 0, err
+		}
 		for i, v := range values {
-			stateSizeIncrease += smp.updateState(sm, v, br, i)
+			state, err := smp.updateState(sm, v, br, i)
+			if err != nil {
+				return 0, err
+			}
+			stateSizeIncrease += state
 		}
 	}
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
-func (smp *statsFieldMaxProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (smp *statsFieldMaxProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sm := sf.(*statsFieldMax)
 	stateSizeIncrease := 0
 
 	c := br.getColumnByName(sm.srcField)
 	if c.isConst {
 		v := c.valuesEncoded[0]
-		stateSizeIncrease += smp.updateState(sm, v, br, rowIdx)
-		return stateSizeIncrease
+		state, err := smp.updateState(sm, v, br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
+		return stateSizeIncrease, nil
 	}
 	if c.isTime {
-		timestamps := br.getTimestamps()
+		timestamps, err := br.getTimestamps()
+		if err != nil {
+			return 0, err
+		}
 		bb := bbPool.Get()
+		defer bbPool.Put(bb)
 		bb.B = marshalTimestampRFC3339NanoString(bb.B[:0], timestamps[rowIdx])
 		v := bytesutil.ToUnsafeString(bb.B)
-		stateSizeIncrease += smp.updateState(sm, v, br, rowIdx)
-		bbPool.Put(bb)
-		return stateSizeIncrease
+		state, err := smp.updateState(sm, v, br, rowIdx)
+		if err != nil {
+			return 0, err
+		}
+		stateSizeIncrease += state
+		return stateSizeIncrease, nil
 	}
 
-	v := c.getValueAtRow(br, rowIdx)
-	stateSizeIncrease += smp.updateState(sm, v, br, rowIdx)
+	v, err := c.getValueAtRow(br, rowIdx)
+	if err != nil {
+		return 0, err
+	}
+	state, err := smp.updateState(sm, v, br, rowIdx)
+	if err != nil {
+		return 0, err
+	}
+	stateSizeIncrease += state
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
 func (smp *statsFieldMaxProcessor) mergeState(_ *chunkedAllocator, _ statsFunc, sfp statsProcessor) {
@@ -191,12 +230,12 @@ func (smp *statsFieldMaxProcessor) needUpdateStateString(v string) bool {
 	return smp.max == "" || lessString(smp.max, v)
 }
 
-func (smp *statsFieldMaxProcessor) updateState(sm *statsFieldMax, v string, br *blockResult, rowIdx int) int {
+func (smp *statsFieldMaxProcessor) updateState(sm *statsFieldMax, v string, br *blockResult, rowIdx int) (int, error) {
 	stateSizeIncrease := 0
 
 	if !smp.needUpdateStateString(v) {
 		// There is no need in updating state
-		return stateSizeIncrease
+		return stateSizeIncrease, nil
 	}
 
 	stateSizeIncrease -= len(smp.max)
@@ -204,12 +243,15 @@ func (smp *statsFieldMaxProcessor) updateState(sm *statsFieldMax, v string, br *
 	smp.max = strings.Clone(v)
 
 	c := br.getColumnByName(sm.fieldName)
-	value := c.getValueAtRow(br, rowIdx)
+	value, err := c.getValueAtRow(br, rowIdx)
+	if err != nil {
+		return 0, err
+	}
 	stateSizeIncrease -= len(smp.value)
 	stateSizeIncrease += len(value)
 	smp.value = strings.Clone(value)
 
-	return stateSizeIncrease
+	return stateSizeIncrease, nil
 }
 
 func (smp *statsFieldMaxProcessor) finalizeStats(_ statsFunc, dst []byte, _ <-chan struct{}) []byte {

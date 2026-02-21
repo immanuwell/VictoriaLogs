@@ -24,12 +24,12 @@ type statsMedianProcessor struct {
 	sqp statsQuantileProcessor
 }
 
-func (smp *statsMedianProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) int {
+func (smp *statsMedianProcessor) updateStatsForAllRows(sf statsFunc, br *blockResult) (int, error) {
 	sm := sf.(*statsMedian)
 	return smp.sqp.updateStatsForAllRows(sm.sq, br)
 }
 
-func (smp *statsMedianProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) int {
+func (smp *statsMedianProcessor) updateStatsForRow(sf statsFunc, br *blockResult, rowIdx int) (int, error) {
 	sm := sf.(*statsMedian)
 	return smp.sqp.updateStatsForRow(sm.sq, br, rowIdx)
 }

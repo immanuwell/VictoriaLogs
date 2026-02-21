@@ -1,8 +1,6 @@
 package logstorage
 
 import (
-	"context"
-
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
@@ -59,7 +57,7 @@ func NewNetQueryRunner(qctx *QueryContext, runNetQuery RunNetQueryFunc, writeNet
 		return nil, err
 	}
 
-	writeBlock := writeNetBlock.newBlockResultWriter()
+	writeBlock := writeNetBlock.newBlockResultWriter(qctx)
 
 	nqr := &NetQueryRunner{
 		qctx:       qctx,
@@ -75,14 +73,13 @@ func NewNetQueryRunner(qctx *QueryContext, runNetQuery RunNetQueryFunc, writeNet
 // The concurrency limits the number of concurrent goroutines, which process the query results at the local host.
 //
 // netSearch must execute the given query q at remote storage nodes and pass results to writeBlock.
-func (nqr *NetQueryRunner) Run(ctx context.Context, concurrency int, netSearch func(stopCh <-chan struct{}, q *Query, writeBlock WriteDataBlockFunc) error) error {
+func (nqr *NetQueryRunner) Run(concurrency int, netSearch func(stopCh <-chan struct{}, q *Query, writeBlock WriteDataBlockFunc) error) error {
 	search := func(stopCh <-chan struct{}, writeBlockToPipes writeBlockResultFunc) error {
 		writeNetBlock := writeBlockToPipes.newDataBlockWriter()
 		return netSearch(stopCh, nqr.qRemote, writeNetBlock)
 	}
 
-	qctxLocal := nqr.qctx.WithContext(ctx)
-	return runPipes(qctxLocal, nqr.pipesLocal, search, nqr.writeBlock, concurrency)
+	return runPipes(nqr.qctx, nqr.pipesLocal, search, nqr.writeBlock, concurrency)
 }
 
 // splitQueryToRemoteAndLocal splits q into remotely executed query and into locally executed pipes.

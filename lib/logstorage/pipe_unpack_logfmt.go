@@ -89,7 +89,7 @@ func (pu *pipeUnpackLogfmt) visitSubqueries(visitFunc func(q *Query)) {
 	pu.iff.visitSubqueries(visitFunc)
 }
 
-func (pu *pipeUnpackLogfmt) newPipeProcessor(_ int, _ <-chan struct{}, _ func(), ppNext pipeProcessor) pipeProcessor {
+func (pu *pipeUnpackLogfmt) newPipeProcessor(_ int, _ <-chan struct{}, cancel func(error), ppNext pipeProcessor) pipeProcessor {
 	unpackLogfmt := func(uctx *fieldsUnpackerContext, s string) {
 		p := getLogfmtParser()
 
@@ -123,7 +123,7 @@ func (pu *pipeUnpackLogfmt) newPipeProcessor(_ int, _ <-chan struct{}, _ func(),
 		putLogfmtParser(p)
 	}
 
-	return newPipeUnpackProcessor(unpackLogfmt, ppNext, pu.fromField, pu.resultPrefix, pu.keepOriginalFields, pu.skipEmptyResults, pu.iff)
+	return newPipeUnpackProcessor(unpackLogfmt, ppNext, cancel, pu.fromField, pu.resultPrefix, pu.keepOriginalFields, pu.skipEmptyResults, pu.iff)
 }
 
 func parsePipeUnpackLogfmt(lex *lexer) (pipe, error) {

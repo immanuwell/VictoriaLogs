@@ -59,70 +59,81 @@ func (fa *filterAnd) matchRow(fields []Field) bool {
 	return true
 }
 
-func (fa *filterAnd) applyToBlockResult(br *blockResult, bm *bitmap) {
+func (fa *filterAnd) applyToBlockResult(br *blockResult, bm *bitmap) error {
 	for _, f := range fa.filters {
-		f.applyToBlockResult(br, bm)
+		if err := f.applyToBlockResult(br, bm); err != nil {
+			return err
+		}
 		if bm.isZero() {
 			// Shortcut - there is no need in applying the remaining filters,
 			// since the result will be zero anyway.
-			return
+			return nil
 		}
 	}
+	return nil
 }
 
-func (fa *filterAnd) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
-	if !fa.matchBloomFilters(bs) {
+func (fa *filterAnd) applyToBlockSearch(bs *blockSearch, bm *bitmap) error {
+	matches, err := fa.matchBloomFilters(bs)
+	if err != nil || !matches {
 		// Fast path - fa doesn't match bloom filters.
 		bm.resetBits()
-		return
+		return err
 	}
 
 	// Slow path - verify every filter separately.
 	for _, f := range fa.filters {
-		f.applyToBlockSearch(bs, bm)
+		if err := f.applyToBlockSearch(bs, bm); err != nil {
+			return err
+		}
 		if bm.isZero() {
 			// Shortcut - there is no need in applying the remaining filters,
 			// since the result will be zero anyway.
-			return
+			return nil
 		}
 	}
+	return nil
 }
 
-func (fa *filterAnd) matchBloomFilters(bs *blockSearch) bool {
+func (fa *filterAnd) matchBloomFilters(bs *blockSearch) (bool, error) {
 	byFieldTokens := fa.getByFieldTokens()
 	if len(byFieldTokens) == 0 {
-		return true
+		return true, nil
 	}
 
 	for _, ft := range byFieldTokens {
 		fieldName := ft.field
 		tokens := ft.tokens
 
-		v := bs.getConstColumnValue(fieldName)
+		v, err := bs.getConstColumnValue(fieldName)
+		if err != nil {
+			return false, err
+		}
 		if v != "" {
 			if matchStringByAllTokens(v, tokens) {
 				continue
 			}
-			return false
+			return false, nil
 		}
 
-		ch := bs.getColumnHeader(fieldName)
-		if ch == nil {
-			return false
+		ch, err := bs.getColumnHeader(fieldName)
+		if err != nil || ch == nil {
+			return false, err
 		}
 
 		if ch.valueType == valueTypeDict {
 			if matchDictValuesByAllTokens(ch.valuesDict.values, tokens) {
 				continue
 			}
-			return false
+			return false, nil
 		}
-		if !matchBloomFilterAllTokens(bs, ch, ft.tokensHashes) {
-			return false
+		matches, err := matchBloomFilterAllTokens(bs, ch, ft.tokensHashes)
+		if err != nil || !matches {
+			return false, err
 		}
 	}
 
-	return true
+	return true, nil
 }
 
 func (fa *filterAnd) getByFieldTokens() []fieldTokens {
